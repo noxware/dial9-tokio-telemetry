@@ -78,6 +78,10 @@ name = "e2e_workload"
 harness = false
 
 [[example]]
+name = "blocking_pool_tracking"
+required-features = ["cpu-profiling"]
+
+[[example]]
 name = "blocking_sleep"
 required-features = ["cpu-profiling"]
 
