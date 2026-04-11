@@ -8,7 +8,7 @@ pub(crate) use shared_state::SharedState;
 use event_writer::EventWriter;
 use runtime_context::{make_poll_end, make_poll_start, make_worker_park, make_worker_unpark};
 
-use crate::metrics::{FlushMetrics, Operation};
+use crate::metrics::{FlushMetrics, Operation, TlDrainMetrics};
 use crate::telemetry::buffer;
 use crate::telemetry::events::RawEvent;
 use crate::telemetry::task_metadata::TaskId;
@@ -736,6 +736,10 @@ impl TracedRuntimeBuilder<HasTracePath> {
                     // are batched into reasonably-sized segments.
                     let mut cycle_count: u64 = 0;
                     const SELF_DRAIN_INTERVAL: u64 = 200;
+                    // Drain all thread-local buffers every ~30s (6000 × 5ms).
+                    // This ensures idle/silent threads don't hold events across
+                    // trace file rotations.
+                    const TL_DRAIN_INTERVAL: u64 = 6000;
                     let sample_interval = Duration::from_millis(10);
                     let mut last_sample = Instant::now();
                     // Snapshot the user-provided segment metadata so we can
@@ -782,6 +786,28 @@ impl TracedRuntimeBuilder<HasTracePath> {
 
                         cycle_count += 1;
                         let drain_self = exit || cycle_count.is_multiple_of(SELF_DRAIN_INTERVAL);
+                        // Periodically drain all thread-local buffers so idle/silent
+                        // threads don't hold events across trace file rotations.
+                        // We bump the epoch one tick early (~5 ms grace period) so
+                        // busy threads self-flush on their next record_event,
+                        // and the intrusive drain only locks truly idle buffers.
+                        // On exit we bump + drain in the same tick since there is
+                        // no next tick for the grace period.
+                        if exit || (cycle_count + 1).is_multiple_of(TL_DRAIN_INTERVAL) {
+                            shared.bump_drain_epoch();
+                        }
+                        if exit || cycle_count.is_multiple_of(TL_DRAIN_INTERVAL) {
+                            let mut tl_drain_timer = Timer::start_now();
+                            let stats = shared.drain_all_tl_buffers();
+                            tl_drain_timer.stop();
+                            let _guard = TlDrainMetrics {
+                                operation: Operation::TlDrain,
+                                duration: tl_drain_timer,
+                                stats,
+                                last_drain: exit,
+                            }
+                            .append_on_drop(flush_metrics_sink.clone());
+                        }
                         let mut flush_timer = Timer::start_now();
                         let stats = flush_once(&mut event_writer, &shared, drain_self);
                         flush_timer.stop();
@@ -956,6 +982,7 @@ mod tests {
     use crate::telemetry::collector::CentralCollector;
     use std::panic::Location;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
 
     /// Drain all pending batches from a `CentralCollector` into an `EventWriter`.
     /// Call `buffer::drain_to_collector` first to flush the thread-local buffer.
@@ -1095,6 +1122,7 @@ mod tests {
             .unwrap();
         let mut ew = EventWriter::new(Box::new(writer));
         let collector = Arc::new(CentralCollector::new());
+        let drain_epoch = AtomicU64::new(0);
 
         let locations = [
             location_a, location_b, location_a, location_b, location_a, location_b,
@@ -1108,6 +1136,7 @@ mod tests {
                     location: loc,
                 },
                 &collector,
+                &drain_epoch,
             );
             buffer::record_event(
                 RawEvent::PollStart {
@@ -1118,6 +1147,7 @@ mod tests {
                     location: loc,
                 },
                 &collector,
+                &drain_epoch,
             );
             // Drain after each iteration to produce separate small batches
             // that trigger file rotation (max_file_size is 100 bytes).
