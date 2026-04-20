@@ -52,7 +52,12 @@ jobs:
   check-docs:
     name: Check docs.rs
     runs-on: ubuntu-latest
-    if: ${{ !startsWith(github.head_ref, 'release-') && !startsWith(github.ref_name, 'release-') }}
+    if: >-
+      ${{
+        github.event_name == 'pull_request'
+        && !startsWith(github.head_ref, 'release-')
+        && !startsWith(github.head_ref, 'release/')
+      }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -89,6 +94,12 @@ jobs:
   package:
     name: Cargo package
     runs-on: ubuntu-latest
+    if: >-
+      ${{
+        github.event_name == 'pull_request'
+        && !startsWith(github.head_ref, 'release-')
+        && !startsWith(github.head_ref, 'release/')
+      }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
