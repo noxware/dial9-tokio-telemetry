@@ -31,9 +31,9 @@ crate::primitives::thread_local! {
     /// cleared in `on_thread_stop`. Enables [`TelemetryHandle::current`].
     static CURRENT_HANDLE: RefCell<Option<TelemetryHandle>> = const { RefCell::new(None) };
 
-    /// Set by `TelemetryHandle::spawn()` before calling `tokio::spawn()`,
-    /// so the `on_task_spawn` hook can distinguish instrumented from raw spawns.
-    static INSTRUMENTED_SPAWN: Cell<bool> = const { Cell::new(false) };
+    /// Nest count for [`InstrumentedSpawnGuard`]. `on_task_spawn` treats
+    /// any value `> 0` as an instrumented spawn.
+    static INSTRUMENTED_SPAWN: Cell<u32> = const { Cell::new(0) };
 }
 
 // ---------------------------------------------------------------------------
@@ -202,7 +202,7 @@ fn register_hooks(
             s5.if_enabled(|buf| {
                 let task_id = TaskId::from(meta.id());
                 let location = meta.spawned_at();
-                let instrumented = INSTRUMENTED_SPAWN.with(|f| f.get());
+                let instrumented = INSTRUMENTED_SPAWN.with(|f| f.get()) > 0;
                 let timestamp_ns = crate::telemetry::events::clock_monotonic_ns();
                 buf.record_encodable_event(&runtime_context::TaskSpawn {
                     timestamp_ns,
@@ -504,13 +504,68 @@ impl TelemetryHandle {
     {
         match self.traced_handle() {
             Some(traced_handle) => {
-                let _guard = InstrumentedSpawnGuard::set();
+                let _guard = InstrumentedSpawnGuard::enter();
                 tokio::spawn(async move {
                     let task_id = tokio::task::try_id().map(TaskId::from).unwrap_or_default();
                     crate::traced::Traced::new(future, traced_handle, task_id).await
                 })
             }
             None => tokio::spawn(future),
+        }
+    }
+
+    /// Wrap `future` so its polls record [`WakeEvent`](crate::telemetry::events::TelemetryEvent::WakeEvent)s
+    /// against this handle's session. Does not spawn.
+    pub fn trace<F>(
+        &self,
+        future: F,
+    ) -> impl std::future::Future<Output = F::Output> + Send + 'static
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let traced_handle = self.traced_handle();
+        async move {
+            match traced_handle {
+                Some(handle) => {
+                    let task_id = tokio::task::try_id().map(TaskId::from).unwrap_or_default();
+                    crate::traced::Traced::new(future, handle, task_id).await
+                }
+                None => future.await,
+            }
+        }
+    }
+
+    /// Run `f` with the instrumented-spawn flag set so any `tokio::spawn`
+    /// inside it produces a `TaskSpawn` event with `instrumented = true`.
+    /// Nestable.
+    pub fn with_instrumented_spawn<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = InstrumentedSpawnGuard::enter();
+        f()
+    }
+
+    /// Spawn `future` into `set` with wake tracking and the `instrumented`
+    /// `TaskSpawn` flag. Panics under the same conditions as
+    /// [`tokio::task::JoinSet::spawn`].
+    #[track_caller]
+    pub fn spawn_in_joinset<F, T>(
+        &self,
+        set: &mut tokio::task::JoinSet<T>,
+        future: F,
+    ) -> tokio::task::AbortHandle
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        match self.traced_handle() {
+            Some(traced_handle) => {
+                let _guard = InstrumentedSpawnGuard::enter();
+                set.spawn(async move {
+                    let task_id = tokio::task::try_id().map(TaskId::from).unwrap_or_default();
+                    crate::traced::Traced::new(future, traced_handle, task_id).await
+                })
+            }
+            None => set.spawn(future),
         }
     }
 }
@@ -536,20 +591,20 @@ where
     TelemetryHandle::current().spawn(future)
 }
 
-/// RAII guard that sets `INSTRUMENTED_SPAWN` to `true` on creation and
-/// resets it to `false` on drop, even if `tokio::spawn` panics.
+/// RAII guard that increments `INSTRUMENTED_SPAWN` on creation and
+/// decrements it on drop, even if the protected closure panics.
 struct InstrumentedSpawnGuard;
 
 impl InstrumentedSpawnGuard {
-    fn set() -> Self {
-        INSTRUMENTED_SPAWN.with(|c| c.set(true));
+    fn enter() -> Self {
+        INSTRUMENTED_SPAWN.with(|c| c.set(c.get().saturating_add(1)));
         Self
     }
 }
 
 impl Drop for InstrumentedSpawnGuard {
     fn drop(&mut self) {
-        INSTRUMENTED_SPAWN.with(|c| c.set(false));
+        INSTRUMENTED_SPAWN.with(|c| c.set(c.get().saturating_sub(1)));
     }
 }
 
@@ -580,13 +635,70 @@ impl RuntimeTelemetryHandle {
         match &self.traced {
             Some(traced) => {
                 let traced = traced.clone();
-                let _guard = InstrumentedSpawnGuard::set();
+                let _guard = InstrumentedSpawnGuard::enter();
                 self.runtime.spawn(async move {
                     let task_id = tokio::task::try_id().map(TaskId::from).unwrap_or_default();
                     crate::traced::Traced::new(future, traced, task_id).await
                 })
             }
             None => self.runtime.spawn(future),
+        }
+    }
+
+    /// See [`TelemetryHandle::trace`].
+    pub fn trace<F>(
+        &self,
+        future: F,
+    ) -> impl std::future::Future<Output = F::Output> + Send + 'static
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let traced = self.traced.clone();
+        async move {
+            match traced {
+                Some(handle) => {
+                    let task_id = tokio::task::try_id().map(TaskId::from).unwrap_or_default();
+                    crate::traced::Traced::new(future, handle, task_id).await
+                }
+                None => future.await,
+            }
+        }
+    }
+
+    /// See [`TelemetryHandle::with_instrumented_spawn`]. Sets the flag on
+    /// the calling thread, not on the runtime's workers.
+    pub fn with_instrumented_spawn<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = InstrumentedSpawnGuard::enter();
+        f()
+    }
+
+    /// Like [`TelemetryHandle::spawn_in_joinset`] but targets this handle's
+    /// runtime via [`tokio::task::JoinSet::spawn_on`], so it works from any
+    /// thread.
+    #[track_caller]
+    pub fn spawn_in_joinset<F, T>(
+        &self,
+        set: &mut tokio::task::JoinSet<T>,
+        future: F,
+    ) -> tokio::task::AbortHandle
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        match &self.traced {
+            Some(traced) => {
+                let traced = traced.clone();
+                let _guard = InstrumentedSpawnGuard::enter();
+                set.spawn_on(
+                    async move {
+                        let task_id = tokio::task::try_id().map(TaskId::from).unwrap_or_default();
+                        crate::traced::Traced::new(future, traced, task_id).await
+                    },
+                    &self.runtime,
+                )
+            }
+            None => set.spawn_on(future, &self.runtime),
         }
     }
 }
@@ -1866,6 +1978,23 @@ mod tests {
             Ok(())
         }
     }
+
+    /// Nested `InstrumentedSpawnGuard`s must compose: inner drop must not
+    /// clear the outer scope. Counter, not flag.
+    #[test]
+    fn instrumented_spawn_guard_nests() {
+        assert_eq!(INSTRUMENTED_SPAWN.with(|c| c.get()), 0);
+        let outer = InstrumentedSpawnGuard::enter();
+        assert_eq!(INSTRUMENTED_SPAWN.with(|c| c.get()), 1);
+        {
+            let _inner = InstrumentedSpawnGuard::enter();
+            assert_eq!(INSTRUMENTED_SPAWN.with(|c| c.get()), 2);
+        }
+        assert_eq!(INSTRUMENTED_SPAWN.with(|c| c.get()), 1);
+        drop(outer);
+        assert_eq!(INSTRUMENTED_SPAWN.with(|c| c.get()), 0);
+    }
+
     #[test]
     fn current_thread_runtime_resolves_worker_ids() {
         let data = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
