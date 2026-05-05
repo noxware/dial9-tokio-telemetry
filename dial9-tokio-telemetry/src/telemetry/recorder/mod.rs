@@ -506,7 +506,7 @@ impl TelemetryHandle {
             Some(traced_handle) => {
                 let _guard = InstrumentedSpawnGuard::enter();
                 tokio::spawn(async move {
-                    let task_id = tokio::task::try_id().map(TaskId::from).unwrap_or_default();
+                    let task_id = TaskId::from(tokio::task::id());
                     crate::traced::Traced::new(future, traced_handle, task_id).await
                 })
             }
@@ -644,7 +644,7 @@ impl RuntimeTelemetryHandle {
                 let traced = traced.clone();
                 let _guard = InstrumentedSpawnGuard::enter();
                 self.runtime.spawn(async move {
-                    let task_id = tokio::task::try_id().map(TaskId::from).unwrap_or_default();
+                    let task_id = TaskId::from(tokio::task::id());
                     crate::traced::Traced::new(future, traced, task_id).await
                 })
             }
