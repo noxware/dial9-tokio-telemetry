@@ -698,13 +698,6 @@ impl RuntimeTelemetryHandle {
         let _guard = InstrumentedSpawnGuard::enter();
         f()
     }
-
-    /// Borrow the underlying [`tokio::runtime::Handle`] for use with APIs
-    /// that need to target this runtime explicitly (e.g.
-    /// [`tokio::task::JoinSet::spawn_on`]).
-    pub fn runtime_handle(&self) -> &tokio::runtime::Handle {
-        &self.runtime
-    }
 }
 
 /// Holds the background worker thread and its stop signal.

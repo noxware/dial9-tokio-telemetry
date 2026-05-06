@@ -246,7 +246,7 @@ fn runtime_handle_composed_joinset_targets_correct_runtime() {
                 tokio::task::yield_now().await;
                 std::thread::current().name().unwrap_or("?").to_string()
             }),
-            handle_a.runtime_handle(),
+            rt_a.handle(),
         );
     });
 
@@ -257,7 +257,7 @@ fn runtime_handle_composed_joinset_targets_correct_runtime() {
                 tokio::task::yield_now().await;
                 std::thread::current().name().unwrap_or("?").to_string()
             }),
-            handle_b.runtime_handle(),
+            rt_b.handle(),
         );
     });
 
