@@ -506,6 +506,8 @@ impl TelemetryHandle {
             Some(traced_handle) => {
                 let _guard = InstrumentedSpawnGuard::enter();
                 tokio::spawn(async move {
+                    // `tokio::task::id()` panics outside a task, but this
+                    // async block is run by `tokio::spawn`.
                     let task_id = TaskId::from(tokio::task::id());
                     crate::traced::Traced::new(future, traced_handle, task_id).await
                 })
@@ -567,7 +569,7 @@ where
             None => {
                 rate_limited!(Duration::from_secs(60), {
                     tracing::warn!(
-                        "trace() future awaited outside a Tokio task context; running future without wake tracking"
+                        "trace() future polled outside a Tokio task context; running future without wake tracking"
                     );
                 });
                 future.await
@@ -644,6 +646,8 @@ impl RuntimeTelemetryHandle {
                 let traced = traced.clone();
                 let _guard = InstrumentedSpawnGuard::enter();
                 self.runtime.spawn(async move {
+                    // `tokio::task::id()` panics outside a task, but this
+                    // async block is run by `Runtime::spawn`.
                     let task_id = TaskId::from(tokio::task::id());
                     crate::traced::Traced::new(future, traced, task_id).await
                 })
@@ -652,7 +656,9 @@ impl RuntimeTelemetryHandle {
         }
     }
 
-    /// See [`TelemetryHandle::trace`].
+    /// Wrap `future` so its polls record
+    /// [`WakeEvent`](crate::telemetry::events::TelemetryEvent::WakeEvent)s
+    /// against this handle's session. Does not spawn.
     ///
     /// # Examples
     ///
@@ -661,11 +667,12 @@ impl RuntimeTelemetryHandle {
     ///
     /// ```rust,no_run
     /// # use dial9_tokio_telemetry::telemetry::RuntimeTelemetryHandle;
+    /// # use tokio::runtime::Runtime;
     /// # use tokio::task::JoinSet;
     /// # async fn work() {}
-    /// # fn demo(handle: RuntimeTelemetryHandle, set: &mut JoinSet<()>) {
+    /// # fn demo(runtime: &Runtime, handle: RuntimeTelemetryHandle, set: &mut JoinSet<()>) {
     /// handle.with_instrumented_spawn(|| {
-    ///     set.spawn_on(handle.trace(work()), handle.runtime_handle());
+    ///     set.spawn_on(handle.trace(work()), runtime.handle());
     /// });
     /// # }
     /// ```
@@ -680,7 +687,12 @@ impl RuntimeTelemetryHandle {
         trace_future(future, self.traced.clone())
     }
 
-    /// See [`TelemetryHandle::with_instrumented_spawn`]. Sets the flag on
+    /// Run `f` with the instrumented-spawn flag set so any `tokio::spawn`
+    /// inside it produces a `TaskSpawn` event with `instrumented = true`.
+    /// Nestable.
+    ///
+    /// Combine with [`trace`](Self::trace) to instrument futures spawned
+    /// through APIs other than [`spawn`](Self::spawn). The flag is set on
     /// the calling thread, not on the runtime's workers.
     pub fn with_instrumented_spawn<R>(&self, f: impl FnOnce() -> R) -> R {
         let _guard = InstrumentedSpawnGuard::enter();
