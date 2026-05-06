@@ -1492,6 +1492,7 @@ dependencies = [
  "aws-sdk-s3-transfer-manager",
  "backtrace",
  "bon",
+ "bytes",
  "clap",
  "criterion",
  "crossbeam-queue",
