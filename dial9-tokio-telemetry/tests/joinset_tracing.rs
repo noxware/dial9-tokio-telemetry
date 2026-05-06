@@ -58,7 +58,7 @@ fn wake_tracking_via_joinset_trace() {
     assert!(saw_wake, "expected WakeEvent for joinset task {expected:?}");
 }
 
-/// Awaiting `trace(fut)` directly in `block_on` runs outside any Tokio task,
+/// Polling `trace(fut)` directly in `block_on` runs outside any Tokio task,
 /// so there is no task ID to attach wake tracking to.
 #[test]
 fn trace_outside_task_context_skips_wake_tracking() {
@@ -92,7 +92,7 @@ fn trace_outside_task_context_skips_wake_tracking() {
         .any(|e| matches!(e, TelemetryEvent::WakeEvent { .. }));
     assert!(
         !saw_wake,
-        "expected no WakeEvent when trace() is awaited outside a task"
+        "expected no WakeEvent when trace() is polled outside a task"
     );
 }
 
