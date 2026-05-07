@@ -1473,7 +1473,8 @@ impl TelemetryCore {
         worker_metrics_sink: Option<metrique_writer::BoxEntrySink>,
     ) -> std::io::Result<TelemetryGuard> {
         let start_mono_ns = crate::telemetry::events::clock_monotonic_ns();
-        let shared = Arc::new(SharedState::new(start_mono_ns));
+        let rng_seed = task_dump_config.as_ref().and_then(|cfg| cfg.rng_seed());
+        let shared = Arc::new(SharedState::new(start_mono_ns, rng_seed));
         if let Some(cfg) = task_dump_config.as_ref() {
             shared.task_dumps_enabled.store(true, Ordering::Relaxed);
             shared
@@ -2127,7 +2128,7 @@ mod tests {
 
     #[test]
     fn test_shared_state_no_spawn_location_fields() {
-        let _shared = SharedState::new(crate::telemetry::events::clock_monotonic_ns());
+        let _shared = SharedState::new(crate::telemetry::events::clock_monotonic_ns(), None);
     }
 
     #[test]
