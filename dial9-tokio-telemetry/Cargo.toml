@@ -16,7 +16,7 @@ rustc-args = ["--cfg", "tokio_unstable", "-C", "force-frame-pointers=yes"]
 all-features = true
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(shuttle)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(shuttle)", "cfg(iai_enabled)"] }
 
 [dependencies]
 tokio = { version = "1.52.0", features = [
@@ -125,6 +125,7 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 async-trait = "0.1.89"
 uuid = { version = "1", features = ["v4"] }
+iai-callgrind = "=0.16.1"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 dial9-tokio-telemetry = { path = ".", features = [
@@ -180,14 +181,6 @@ required-features = ["cpu-profiling", "analysis"]
 name = "thread_per_core"
 required-features = ["analysis"]
 
-[[bench]]
-name = "writer_encode"
-harness = false
-
-[[bench]]
-name = "threadlocal_encode"
-harness = false
-
 [[example]]
 name = "tracing_sleep"
 required-features = ["tracing-layer"]
@@ -196,3 +189,20 @@ required-features = ["tracing-layer"]
 name = "tracing_layer_bench"
 harness = false
 required-features = ["tracing-layer"]
+
+[[bench]]
+name = "tracing_layer_iai"
+harness = false
+required-features = ["tracing-layer"]
+
+[[bench]]
+name = "writer_encode_iai"
+harness = false
+
+[[bench]]
+name = "threadlocal_encode_iai"
+harness = false
+
+[[bench]]
+name = "writer_write_encoded_iai"
+harness = false

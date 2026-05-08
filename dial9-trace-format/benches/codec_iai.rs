@@ -1,7 +1,24 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+//! IAI callgrind encode/decode micro-benchmarks over a 1M-event mix
+//! (20% PollStart / PollEnd / WorkerPark / WakeEvent / CpuSample with
+//! stack frames). Linux-only.
+//!
+//! Usage:
+//!   cargo bench --bench codec_iai
+//!
+//! Gated on `--cfg iai_enabled` so plain `cargo test --all-targets`
+//! compiles to a no-op stub `fn main()` instead of spawning
+//! `iai-callgrind-runner`. CI iai jobs set RUSTFLAGS to enable.
+
+#![cfg_attr(not(iai_enabled), allow(unused))]
+
+#[cfg(not(iai_enabled))]
+fn main() {}
+
 use dial9_trace_format::decoder::Decoder;
 use dial9_trace_format::encoder::Encoder;
-use dial9_trace_format::{InternedStackFrames, TraceEvent};
+use dial9_trace_format::{StackFrames, TraceEvent};
+use iai_callgrind::{library_benchmark, library_benchmark_group, main};
+use std::hint::black_box;
 
 #[derive(TraceEvent)]
 struct PollStart {
@@ -41,7 +58,7 @@ struct CpuSample {
     worker_id: u64,
     tid: u32,
     source: u8,
-    frames: InternedStackFrames,
+    frames: StackFrames,
 }
 
 const N: u64 = 1_000_000;
@@ -74,8 +91,12 @@ fn encode_events(enc: &mut Encoder, n: u64) {
                 woken_task_id: 1000 + ((i + 1) % 5000),
                 target_worker: i % 8,
             }),
-            _ => {
-                let frames = enc.intern_stack_frames_infallible(&[
+            _ => enc.write(&CpuSample {
+                timestamp_ns: ts,
+                worker_id: i % 8,
+                tid: 12345 + (i % 4) as u32,
+                source: 0,
+                frames: StackFrames(vec![
                     0x5555_5555_0000 + (i % 100) * 0x10,
                     0x5555_5555_1000 + (i % 50) * 0x20,
                     0x5555_5555_2000,
@@ -92,68 +113,62 @@ fn encode_events(enc: &mut Encoder, n: u64) {
                     0x5555_5555_d000,
                     0x5555_5555_e000,
                     0x5555_5555_f000,
-                ]);
-                enc.write(&CpuSample {
-                    timestamp_ns: ts,
-                    worker_id: i % 8,
-                    tid: 12345 + (i % 4) as u32,
-                    source: 0,
-                    frames,
-                })
-            }
+                ]),
+            }),
         }
         .unwrap()
     }
 }
 
-fn bench_encode(c: &mut Criterion) {
-    c.bench_function("encode_1M_events", |b| {
-        b.iter(|| {
-            let mut enc = Encoder::new();
-            encode_events(&mut enc, N);
-            black_box(enc.finish());
-        });
-    });
-}
-
-fn bench_decode(c: &mut Criterion) {
-    // Pre-encode once
+fn pre_encode(n: u64) -> Vec<u8> {
     let mut enc = Encoder::new();
-    encode_events(&mut enc, N);
-    let data = enc.finish();
-
-    c.bench_function("decode_1M_events", |b| {
-        b.iter(|| {
-            let mut dec = Decoder::new(black_box(&data)).unwrap();
-            let frames = dec.decode_all();
-            black_box(frames.len());
-        });
-    });
-
-    c.bench_function("decode_1M_events_ref", |b| {
-        b.iter(|| {
-            let mut dec = Decoder::new(black_box(&data)).unwrap();
-            let frames = dec.decode_all_ref();
-            black_box(frames.len());
-        });
-    });
-
-    c.bench_function("decode_1M_events_visit", |b| {
-        b.iter(|| {
-            let mut dec = Decoder::new(black_box(&data)).unwrap();
-            let mut count = 0u64;
-            dec.for_each_event(|_ev| {
-                count += 1;
-            })
-            .unwrap();
-            black_box(count);
-        });
-    });
+    encode_events(&mut enc, n);
+    enc.finish()
 }
 
-criterion_group! {
-    name = benches;
-    config = Criterion::default().sample_size(10);
-    targets = bench_encode, bench_decode
+#[library_benchmark]
+#[bench::events_1m(N)]
+fn encode(n: u64) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    encode_events(&mut enc, black_box(n));
+    black_box(enc.finish())
 }
-criterion_main!(benches);
+
+#[library_benchmark]
+#[bench::events_1m(pre_encode(N))]
+fn decode_all(data: Vec<u8>) -> usize {
+    let data = black_box(data);
+    let mut dec = Decoder::new(&data).unwrap();
+    let frames = dec.decode_all();
+    black_box(frames.len())
+}
+
+#[library_benchmark]
+#[bench::events_1m(pre_encode(N))]
+fn decode_all_ref(data: Vec<u8>) -> usize {
+    let data = black_box(data);
+    let mut dec = Decoder::new(&data).unwrap();
+    let frames = dec.decode_all_ref();
+    black_box(frames.len())
+}
+
+#[library_benchmark]
+#[bench::events_1m(pre_encode(N))]
+fn for_each_event(data: Vec<u8>) -> u64 {
+    let data = black_box(data);
+    let mut dec = Decoder::new(&data).unwrap();
+    let mut count = 0u64;
+    dec.for_each_event(|_ev| {
+        count += 1;
+    })
+    .unwrap();
+    black_box(count)
+}
+
+library_benchmark_group!(
+    name = codec_group;
+    benchmarks = encode, decode_all, decode_all_ref, for_each_event
+);
+
+#[cfg(iai_enabled)]
+main!(library_benchmark_groups = codec_group);

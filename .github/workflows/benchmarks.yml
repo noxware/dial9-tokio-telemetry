@@ -1,136 +1,80 @@
-# Continuous benchmarking with Bencher (https://bencher.dev)
+# Continuous benchmarking with Bencher (https://bencher.dev).
 #
 # PREREQUISITES:
 #   1. Create a project at https://bencher.dev and note its slug.
 #   2. Add the following in GitHub → Settings → Secrets and variables → Actions:
 #      - Secret  BENCHER_API_TOKEN: API token from bencher.dev
 #      - Variable BENCHER_PROJECT:  your project slug
-#   3. GITHUB_TOKEN is provided automatically — no setup needed.
 #
-# overhead_bench uses a custom harness (not Criterion). Its --bmf flag
-# outputs Bencher Metric Format directly.
+# This workflow posts numbers and maintains the persistent regression
+# threshold on the target branch. The PR gate (benchmarks-pr.yml) reads
+# main's threshold via --start-point-reset.
 
 name: Benchmarks
 
 on:
   push:
-    branches:
-      - main
-  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'examples/**'
+      - 'dial9-viewer/**'
+      - '.github/ISSUE_TEMPLATE/**'
   workflow_dispatch:
+    inputs:
+      bencher_branch:
+        description: 'Override Bencher branch name (e.g. "main" to seed baseline from a feature branch). Leave empty to use the running branch.'
+        required: false
+        default: ''
 
 permissions:
   checks: write
   pull-requests: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
 jobs:
-  # Runs on every push to main to build the statistical baseline.
-  benchmark_main:
-    name: Benchmark — ${{ matrix.bench.name }} (main baseline)
-    if: ${{ false && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }} # skip job
+  baseline:
+    name: baseline
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        bench:
-          - name: writer_encode
-            adapter: rust_criterion
-            command: cargo bench --package dial9-tokio-telemetry --bench writer_encode
-          - name: codec
-            adapter: rust_criterion
-            command: cargo bench --package dial9-trace-format --bench codec
-          - name: overhead_bench
-            adapter: json
-            command: cargo bench --bench overhead_bench -- --bmf 10
-          - name: overhead_bench_ctimer
-            adapter: json
-            command: DIAL9_FORCE_CTIMER=1 cargo bench --bench overhead_bench -- --bmf 10
-          - name: e2e_workload
-            adapter: json
-            command: cargo bench --bench e2e_workload -- --bmf 10
     env:
       RUST_BACKTRACE: 1
       BENCHER_PROJECT: ${{ vars.BENCHER_PROJECT }}
+      # Mirror .cargo/config.toml [build] rustflags + add iai_enabled cfg
+      # so bench files compile their real iai entry point (not the no-op
+      # stub `cargo test --all-targets` uses).
+      RUSTFLAGS: '--cfg tokio_unstable -C force-frame-pointers=yes --cfg iai_enabled'
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Enable perf_event_open and kallsyms
-        run: |
-          sudo sysctl kernel.perf_event_paranoid=1
-          sudo sysctl kernel.kptr_restrict=0
-
-      - uses: bencherdev/bencher@0f8f620172ccd6225d40a7590598eb7b41718af8 # v0.6.2
-
-      - name: Run benchmark
-        run: |
-          bencher run \
-            --token '${{ secrets.BENCHER_API_TOKEN }}' \
-            --branch '${{ github.ref_name }}' \
-            --testbed ubuntu-latest \
-            --adapter '${{ matrix.bench.adapter }}' \
-            "${{ matrix.bench.command }}"
-
-  # Runs on same-repo PRs. Fork PRs are skipped — they have no access to
-  # BENCHER_API_TOKEN, so the job would fail rather than silently skip.
-  benchmark_pr:
-    name: Benchmark — ${{ matrix.bench.name }} (PR regression check)
-    if: ${{ false && (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) }} # skip job
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        bench:
-          - name: writer_encode
-            adapter: rust_criterion
-            command: cargo bench --package dial9-tokio-telemetry --bench writer_encode
-          - name: codec
-            adapter: rust_criterion
-            command: cargo bench --package dial9-trace-format --bench codec
-          - name: overhead_bench
-            adapter: json
-            command: cargo bench --bench overhead_bench -- --bmf 10
-          - name: overhead_bench_ctimer
-            adapter: json
-            command: DIAL9_FORCE_CTIMER=1 cargo bench --bench overhead_bench -- --bmf 10
-          - name: e2e_workload
-            adapter: json
-            command: cargo bench --bench e2e_workload -- --bmf 10
-    env:
-      RUST_BACKTRACE: 1
-      BENCHER_PROJECT: ${{ vars.BENCHER_PROJECT }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Enable perf_event_open and kallsyms
-        run: |
-          sudo sysctl kernel.perf_event_paranoid=1
-          sudo sysctl kernel.kptr_restrict=0
-
-      - uses: bencherdev/bencher@0f8f620172ccd6225d40a7590598eb7b41718af8 # v0.6.2
-
-      - name: Run benchmark
-        run: |
-          bencher run \
-            --token '${{ secrets.BENCHER_API_TOKEN }}' \
-            --branch '${{ github.head_ref }}' \
-            --start-point main \
-            --start-point-reset \
-            --testbed ubuntu-latest \
-            --adapter '${{ matrix.bench.adapter }}' \
-            --threshold-measure latency \
-            --threshold-test percentage \
-            --threshold-lower-boundary _ \
-            --threshold-upper-boundary 0.25 \
-            --threshold-measure throughput \
-            --threshold-test percentage \
-            --threshold-lower-boundary 0.25 \
-            --threshold-upper-boundary _ \
-            --error-on-alert \
-            --github-actions '${{ secrets.GITHUB_TOKEN }}' \
-            "${{ matrix.bench.command }}"
+      - uses: ./.github/actions/iai-bench
+        with:
+          bencher-token: ${{ secrets.BENCHER_API_TOKEN }}
+          bencher-branch: ${{ github.event.inputs.bencher_branch != '' && github.event.inputs.bencher_branch || github.ref_name }}
+          bencher-extra-args: >-
+            --threshold-measure instructions
+            --threshold-test percentage
+            --threshold-max-sample-size 1
+            --threshold-upper-boundary 0.01
+            --threshold-measure l1-hits
+            --threshold-test percentage
+            --threshold-max-sample-size 1
+            --threshold-upper-boundary 0.01
+            --threshold-measure ram-hits
+            --threshold-test percentage
+            --threshold-max-sample-size 1
+            --threshold-upper-boundary 0.01
+            --threshold-measure total-read-write
+            --threshold-test percentage
+            --threshold-max-sample-size 1
+            --threshold-upper-boundary 0.01
+            --threshold-measure estimated-cycles
+            --threshold-test percentage
+            --threshold-max-sample-size 1
+            --threshold-upper-boundary 0.01
+            --threshold-measure ll-hits
+            --threshold-test percentage
+            --threshold-max-sample-size 1
+            --threshold-upper-boundary 0.05

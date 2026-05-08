@@ -1,26 +1,31 @@
-//! Benchmark for the writer encode path: TraceEvent → RotatingWriter → Encoder.
+//! iai-callgrind benchmark for writer-side encoded-batch ingestion.
 //!
-//! This exercises the full `write_resolved` path including event conversion,
-//! string interning, and varint encoding. Writes to `/dev/null` to isolate
-//! encoding cost from disk I/O.
+//! Measures `RotatingWriter::write_encoded_batch` on pre-encoded `Batch`
+//! payloads so we can track writer-path regressions separately from encoder
+//! regressions. Uses a temporary file-backed writer (same path as production)
+//! and flushes once per run.
 //!
 //! Usage:
-//!   cargo bench --bench writer_encode
+//!   cargo bench --package dial9-tokio-telemetry --bench writer_write_encoded_iai
+//!
+//! Gated on `--cfg iai_enabled` so plain `cargo test --all-targets`
+//! compiles to a no-op stub `fn main()` instead of spawning
+//! `iai-callgrind-runner`. CI iai jobs set RUSTFLAGS to enable.
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+#![cfg_attr(not(iai_enabled), allow(unused))]
+
+#[cfg(not(iai_enabled))]
+fn main() {}
+
 use dial9_tokio_telemetry::telemetry::{
     Batch, PollEndEvent, PollStartEvent, RotatingWriter, TaskId, TaskSpawnEvent, TraceWriter,
     WakeEventEvent, WorkerId, WorkerParkEvent, WorkerUnparkEvent,
 };
 use dial9_trace_format::encoder::Encoder;
+use iai_callgrind::{library_benchmark, library_benchmark_group, main};
+use std::hint::black_box;
 use tempfile::TempDir;
 
-/// Build a realistic batch simulating a worker thread's activity.
-///
-/// A typical worker cycle is: unpark → (poll_start, poll_end) × N → park.
-/// We simulate ~170 polls per batch (340 events) plus park/unpark and a few
-/// spawns and wakes, totalling ~350 events. The batch is repeated ~3× to fill
-/// close to 1024 events.
 fn make_encoded_batch(worker: usize) -> Batch {
     let wid = WorkerId::from(worker);
     let task = TaskId::from_u32(1);
@@ -79,33 +84,35 @@ fn make_encoded_batch(worker: usize) -> Batch {
     Batch::new(enc.reset_to_infallible(Vec::new()), 1024)
 }
 
-fn bench_writer_encode(c: &mut Criterion) {
-    let mut group = c.benchmark_group("writer_encode");
-
-    for num_batches in [1, 10, 100] {
-        let batches: Vec<_> = (0..num_batches)
-            .map(|i| make_encoded_batch(i % 8))
-            .collect();
-        let total_events: usize = num_batches * 1024; // approximate
-        group.throughput(criterion::Throughput::Elements(total_events as u64));
-
-        group.bench_with_input(
-            BenchmarkId::new("batches", num_batches),
-            &batches,
-            |b, batches| {
-                let tmp = TempDir::new().unwrap();
-                let mut writer = RotatingWriter::single_file(tmp.path().join("trace")).unwrap();
-                b.iter(|| {
-                    for batch in batches {
-                        writer.write_encoded_batch(batch).unwrap();
-                    }
-                    writer.flush().unwrap();
-                });
-            },
-        );
-    }
-    group.finish();
+fn batches(num_batches: usize) -> Vec<Batch> {
+    (0..num_batches)
+        .map(|i| make_encoded_batch(i % 8))
+        .collect()
 }
 
-criterion_group!(benches, bench_writer_encode);
-criterion_main!(benches);
+fn write_encoded(batches: Vec<Batch>) -> usize {
+    let tmp = TempDir::new().unwrap();
+    let mut writer = RotatingWriter::single_file(tmp.path().join("trace")).unwrap();
+    let mut total_bytes = 0usize;
+
+    for batch in &batches {
+        total_bytes += batch.encoded_bytes().len();
+        writer.write_encoded_batch(batch).unwrap();
+    }
+
+    writer.flush().unwrap();
+    total_bytes
+}
+
+#[library_benchmark]
+#[bench::batches_1(batches(1))]
+#[bench::batches_10(batches(10))]
+#[bench::batches_100(batches(100))]
+fn writer_write_encoded(batches: Vec<Batch>) -> usize {
+    black_box(write_encoded(black_box(batches)))
+}
+
+library_benchmark_group!(name = writer_group; benchmarks = writer_write_encoded);
+
+#[cfg(iai_enabled)]
+main!(library_benchmark_groups = writer_group);
