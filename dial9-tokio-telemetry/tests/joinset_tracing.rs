@@ -1,6 +1,13 @@
 //! Integration tests for the JoinSet-friendly tracing API:
-//! - `TelemetryHandle::trace` / `RuntimeTelemetryHandle::trace`
-//! - `TelemetryHandle::with_instrumented_spawn` / mirror on runtime handle
+//! - [`TelemetryHandle::spawn_with`]
+//! - [`RuntimeTelemetryHandle::spawn_with`]
+//!
+//! `spawn_with(fut, |f| spawn_fn(f))` is the way to spawn a wake-tracked
+//! future through APIs other than `TelemetryHandle::spawn` (e.g.
+//! `tokio::task::JoinSet::spawn`, `JoinSet::spawn_on`, etc.). It must:
+//!   - emit `WakeEvent`s for the polled future, and
+//!   - mark the resulting `TaskSpawn` as `instrumented = true`,
+//!   - while preserving the user's call site as `spawn_loc`.
 
 mod common;
 
@@ -23,10 +30,10 @@ fn build_traced_runtime<W: TraceWriter + 'static>(writer: W) -> (Runtime, Teleme
         .unwrap()
 }
 
-/// `set.spawn(handle.trace(fut))` produces `WakeEvent`s for the spawned
-/// task — the same as `handle.spawn(fut)` would.
+/// `spawn_with(fut, |f| set.spawn(f))` produces `WakeEvent`s for the
+/// spawned task — the same as `handle.spawn(fut)` would.
 #[test]
-fn wake_tracking_via_joinset_trace() {
+fn spawn_with_joinset_emits_wake_events() {
     let (writer, events) = common::CapturingWriter::new();
     let (runtime, guard) = build_traced_runtime(writer);
 
@@ -39,10 +46,13 @@ fn wake_tracking_via_joinset_trace() {
         // `yield_now().await` self-wakes through the active waker, which
         // here is our `Traced` waker — so a `WakeEvent` fires without
         // depending on cross-task scheduling order.
-        set.spawn(handle.trace(async move {
-            *id_w.lock().unwrap() = tokio::task::try_id().map(TaskId::from);
-            tokio::task::yield_now().await;
-        }));
+        handle.spawn_with(
+            async move {
+                *id_w.lock().unwrap() = tokio::task::try_id().map(TaskId::from);
+                tokio::task::yield_now().await;
+            },
+            |f| set.spawn(f),
+        );
         while set.join_next().await.is_some() {}
         tokio::time::sleep(Duration::from_millis(200)).await;
     });
@@ -58,50 +68,12 @@ fn wake_tracking_via_joinset_trace() {
     assert!(saw_wake, "expected WakeEvent for joinset task {expected:?}");
 }
 
-/// Polling `trace(fut)` directly in `block_on` runs outside any Tokio task,
-/// so there is no task ID to attach wake tracking to.
+/// `spawn_with` flips the `TaskSpawn` `instrumented` flag for the spawn
+/// performed inside the closure, AND because the closure body lives in
+/// user code, `JoinSet::spawn`'s `#[track_caller]` resolves `spawn_loc`
+/// to the user's file (NOT the library).
 #[test]
-fn trace_outside_task_context_skips_wake_tracking() {
-    let (writer, events) = common::CapturingWriter::new();
-    let (runtime, guard) = build_traced_runtime(writer);
-
-    let handle = guard.handle();
-    let observed_id: Arc<Mutex<Option<Option<TaskId>>>> = Arc::new(Mutex::new(None));
-    let id_w = observed_id.clone();
-
-    runtime.block_on(async move {
-        let result = handle
-            .trace(async move {
-                *id_w.lock().unwrap() = Some(tokio::task::try_id().map(TaskId::from));
-                tokio::task::yield_now().await;
-                7u32
-            })
-            .await;
-        assert_eq!(result, 7);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    });
-
-    drop(runtime);
-    drop(guard);
-
-    assert_eq!(*observed_id.lock().unwrap(), Some(None));
-    let saw_wake = events
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|e| matches!(e, TelemetryEvent::WakeEvent { .. }));
-    assert!(
-        !saw_wake,
-        "expected no WakeEvent when trace() is polled outside a task"
-    );
-}
-
-/// `with_instrumented_spawn` flips the TaskSpawn `instrumented` flag for
-/// any spawn that happens inside the closure, AND because the closure body
-/// lives in user code, `tokio::spawn`'s `#[track_caller]` resolves
-/// `spawn_loc` to the user's file (NOT to the library).
-#[test]
-fn with_instrumented_spawn_marks_taskspawn_and_preserves_caller() {
+fn spawn_with_marks_taskspawn_and_preserves_caller() {
     let dir = tempfile::tempdir().unwrap();
     let trace_path = dir.path().join("trace.bin");
     let writer = RotatingWriter::single_file(&trace_path).unwrap();
@@ -110,13 +82,15 @@ fn with_instrumented_spawn_marks_taskspawn_and_preserves_caller() {
     let handle = guard.handle();
 
     runtime.block_on(async move {
-        // Inside the closure: marked instrumented, caller = this file.
-        let join = handle.with_instrumented_spawn(|| tokio::spawn(async {}));
-        join.await.unwrap();
+        let mut set: JoinSet<()> = JoinSet::new();
 
-        // Outside the closure: NOT instrumented.
+        // Inside `spawn_with`: marked instrumented, caller = this file.
+        handle.spawn_with(async {}, |f| set.spawn(f));
+
+        // Outside `spawn_with`: NOT instrumented.
         tokio::spawn(async {}).await.unwrap();
 
+        while set.join_next().await.is_some() {}
         tokio::time::sleep(Duration::from_millis(200)).await;
     });
 
@@ -159,73 +133,32 @@ fn with_instrumented_spawn_marks_taskspawn_and_preserves_caller() {
     assert!(raw >= 1, "expected at least 1 raw TaskSpawn, got {raw}");
 }
 
-/// Composing `with_instrumented_spawn` + `trace` + `JoinSet::spawn`
-/// emits wake events AND marks `TaskSpawn` instrumented. Caller location
-/// resolves to the user's file because the closure body lives there.
+/// `spawn_with` returns whatever the closure returns. Useful so callers
+/// can keep the `JoinHandle` / `AbortHandle` / etc. produced by their
+/// spawn function.
 #[test]
-fn composed_joinset_spawn_emits_wakes_and_marks_instrumented() {
-    let dir = tempfile::tempdir().unwrap();
-    let trace_path = dir.path().join("trace.bin");
-    let writer = RotatingWriter::single_file(&trace_path).unwrap();
+fn spawn_with_returns_closure_value() {
+    let (writer, _events) = common::CapturingWriter::new();
     let (runtime, guard) = build_traced_runtime(writer);
 
     let handle = guard.handle();
-    let spawned_id: Arc<Mutex<Option<TaskId>>> = Arc::new(Mutex::new(None));
-    let id_w = spawned_id.clone();
 
     runtime.block_on(async move {
-        let mut set: JoinSet<()> = JoinSet::new();
-        handle.with_instrumented_spawn(|| {
-            set.spawn(handle.trace(async move {
-                *id_w.lock().unwrap() = tokio::task::try_id().map(TaskId::from);
-                tokio::task::yield_now().await;
-            }))
-        });
-        while set.join_next().await.is_some() {}
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let join = handle.spawn_with(async { 42u32 }, tokio::spawn);
+        let value = join.await.unwrap();
+        assert_eq!(value, 42);
     });
 
     drop(runtime);
     drop(guard);
-
-    let sealed = dir.path().join("trace.0.bin");
-    let reader = TraceReader::new(sealed.to_str().unwrap()).unwrap();
-    let expected = spawned_id.lock().unwrap().expect("task id captured");
-
-    let saw_wake = reader.runtime_events.iter().any(|e| {
-        matches!(e, TelemetryEvent::WakeEvent { woken_task_id, .. } if *woken_task_id == expected)
-    });
-    assert!(saw_wake, "expected WakeEvent for traced joinset task");
-
-    let mut found_instrumented = false;
-    for event in &reader.all_events {
-        if let TelemetryEvent::TaskSpawn {
-            spawn_loc,
-            instrumented: Some(true),
-            ..
-        } = event
-        {
-            let loc = reader
-                .spawn_locations
-                .get(spawn_loc)
-                .expect("spawn_loc should resolve");
-            if loc.contains("joinset_tracing.rs") {
-                found_instrumented = true;
-                break;
-            }
-        }
-    }
-    assert!(
-        found_instrumented,
-        "expected an instrumented TaskSpawn pointing to joinset_tracing.rs"
-    );
 }
 
-/// Composing the `RuntimeTelemetryHandle` API with `JoinSet::spawn_on`
-/// targets the correct runtime even when called from outside any runtime
-/// context.
+/// `RuntimeTelemetryHandle::spawn_with` composes with `JoinSet::spawn_on`
+/// to target a specific runtime even when called from outside any
+/// runtime context, while still emitting wake events and marking the
+/// `TaskSpawn` instrumented.
 #[test]
-fn runtime_handle_composed_joinset_targets_correct_runtime() {
+fn runtime_handle_spawn_with_targets_correct_runtime() {
     use dial9_tokio_telemetry::telemetry::{NullWriter, TelemetryCore};
 
     let guard = TelemetryCore::builder().writer(NullWriter).build().unwrap();
@@ -240,26 +173,22 @@ fn runtime_handle_composed_joinset_targets_correct_runtime() {
     let (rt_b, handle_b) = guard.trace_runtime("b").build(builder_b).unwrap();
 
     let mut set_a: JoinSet<String> = JoinSet::new();
-    handle_a.with_instrumented_spawn(|| {
-        set_a.spawn_on(
-            handle_a.trace(async {
-                tokio::task::yield_now().await;
-                std::thread::current().name().unwrap_or("?").to_string()
-            }),
-            rt_a.handle(),
-        );
-    });
+    handle_a.spawn_with(
+        async {
+            tokio::task::yield_now().await;
+            std::thread::current().name().unwrap_or("?").to_string()
+        },
+        |f| set_a.spawn_on(f, rt_a.handle()),
+    );
 
     let mut set_b: JoinSet<String> = JoinSet::new();
-    handle_b.with_instrumented_spawn(|| {
-        set_b.spawn_on(
-            handle_b.trace(async {
-                tokio::task::yield_now().await;
-                std::thread::current().name().unwrap_or("?").to_string()
-            }),
-            rt_b.handle(),
-        );
-    });
+    handle_b.spawn_with(
+        async {
+            tokio::task::yield_now().await;
+            std::thread::current().name().unwrap_or("?").to_string()
+        },
+        |f| set_b.spawn_on(f, rt_b.handle()),
+    );
 
     let name_a = rt_a.block_on(async move { set_a.join_next().await.unwrap().unwrap() });
     let name_b = rt_b.block_on(async move { set_b.join_next().await.unwrap().unwrap() });
