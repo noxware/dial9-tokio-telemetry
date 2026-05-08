@@ -100,6 +100,12 @@ pin_project! {
         sample_mean_ns: u64,
         // Per-task PRNG for drawing exponential gaps.
         rng: SplitMix64,
+        // Set after `capture()` re-polls the inner future with the real waker.
+        // The re-poll causes a spurious immediate wake; this flag suppresses
+        // the next capture to break the busy loop (capture → wake → poll →
+        // capture → …). Cleared on the next poll so subsequent real wakes
+        // proceed normally.
+        just_captured: bool,
     }
 }
 
@@ -126,6 +132,7 @@ impl<F> TaskDumped<F> {
             next_sample_ns,
             sample_mean_ns,
             rng,
+            just_captured: false,
         }
     }
 }
@@ -172,51 +179,87 @@ impl<F: Future> Future for TaskDumped<F> {
                 *this.pending_capture_ts = None;
             }
             Poll::Pending => {
-                this.frames.capture(this.inner.as_mut(), cx);
-                let poll_end = crate::telemetry::recorder::poll_start_ts_or_now();
-                *this.pending_capture_ts = NonZeroU64::new(poll_end);
+                // Skip capture if this poll was triggered by the spurious wake
+                // from the previous capture's re-poll. This breaks the busy
+                // loop: capture → wake → poll → capture → …
+                if *this.just_captured {
+                    *this.just_captured = false;
+                } else {
+                    this.frames.capture(this.inner.as_mut(), cx);
+                    *this.just_captured = true;
+                    let poll_end = crate::telemetry::recorder::poll_start_ts_or_now();
+                    *this.pending_capture_ts = NonZeroU64::new(poll_end);
+                }
             }
         }
         result
     }
 }
 
+/// Metadata for one captured callchain stored in [`FrameBuf`].
+struct ChainMeta {
+    /// Index into `FrameBuf::ips` where this chain's frames start.
+    ip_start: usize,
+    /// Address of the root function (upper trim boundary). `None` means trim
+    /// to the end of the buffer.
+    root_addr: Option<*const core::ffi::c_void>,
+    /// Address of the leaf function (lower trim boundary). `None` means no
+    /// leaf boundary was available; the chain will be skipped at emit time.
+    leaf_addr: Option<*const core::ffi::c_void>,
+}
+
+// SAFETY: raw pointers are only used for address comparison, never dereferenced
+// across threads.
+unsafe impl Send for ChainMeta {}
+
 /// Reusable storage for one or more callchains captured during a single
 /// `trace_with` sub-poll. Frames are appended flat to `ips`; each new chain's
-/// start index is pushed onto `offsets`.
+/// metadata is pushed onto `chains`.
 struct FrameBuf {
     ips: Vec<u64>,
-    offsets: SmallVec<[usize; 8]>,
+    chains: SmallVec<[ChainMeta; 4]>,
 }
 
 impl FrameBuf {
     fn new() -> Self {
         Self {
             ips: Vec::new(),
-            offsets: SmallVec::new(),
+            chains: SmallVec::new(),
         }
     }
 
     fn clear(&mut self) {
         self.ips.clear();
-        self.offsets.clear();
+        self.chains.clear();
     }
 
     fn has_data(&self) -> bool {
-        !self.offsets.is_empty()
+        !self.chains.is_empty()
     }
 
     /// Emit one `TaskDumpEvent` per recorded callchain, then clear.
+    /// Trimming via `_Unwind_FindEnclosingFunction` happens here (emit path)
+    /// rather than during capture, keeping the hot path lock-free.
     fn emit(&mut self, shared: &SharedState, task_id: TaskId, capture_ts: u64) {
         shared.if_enabled(|buf| {
-            for i in 0..self.offsets.len() {
-                let start = self.offsets[i];
-                let end = self.offsets.get(i + 1).copied().unwrap_or(self.ips.len());
-                buf.record_encodable_event(&TaskDumpData {
-                    timestamp_ns: capture_ts,
-                    task_id,
-                    callchain: &self.ips[start..end],
-                });
+            for (i, meta) in self.chains.iter().enumerate() {
+                let ip_end = self
+                    .chains
+                    .get(i + 1)
+                    .map(|next| next.ip_start)
+                    .unwrap_or(self.ips.len());
+                let raw = &self.ips[meta.ip_start..ip_end];
+                let chain = match meta.leaf_addr {
+                    Some(leaf) => crate::unwind::trim_frames(raw, meta.root_addr, leaf),
+                    None => &[],
+                };
+                if !chain.is_empty() {
+                    buf.record_encodable_event(&TaskDumpData {
+                        timestamp_ns: capture_ts,
+                        task_id,
+                        callchain: chain,
+                    });
+                }
             }
         });
         self.clear();
@@ -231,7 +274,7 @@ impl FrameBuf {
         self.clear();
 
         let ips = &mut self.ips;
-        let offsets = &mut self.offsets;
+        let chains = &mut self.chains;
 
         // `trace_with`'s outer closure is `FnOnce`; `Option::take` moves the
         // pinned reference in without requiring a `Copy` bound or unsafe.
@@ -240,22 +283,20 @@ impl FrameBuf {
                 let _ = inner.poll(cx);
             },
             |meta| {
-                offsets.push(ips.len());
-                capture_frames(ips, meta.root_addr, meta.trace_leaf_addr);
+                let ip_start = ips.len();
+                // Hot path: collect raw IPs only — no _Unwind_FindEnclosingFunction,
+                // no dl_iterate_phdr, no global locks. Trimming to root/leaf
+                // boundaries happens later in emit().
+                crate::unwind::collect_frames_raw(ips);
+                // Stash the root/leaf addresses so we can trim at emit time.
+                chains.push(ChainMeta {
+                    ip_start,
+                    root_addr: meta.root_addr,
+                    leaf_addr: Some(meta.trace_leaf_addr),
+                });
             },
         );
     }
-}
-
-/// Walk the stack, collecting instruction pointers between `leaf_addr` and
-/// `root_addr`. Calls `_Unwind_Backtrace` directly via [`crate::unwind`],
-/// bypassing the `backtrace` crate's process-wide mutex.
-fn capture_frames(
-    ips: &mut Vec<u64>,
-    root_addr: Option<*const core::ffi::c_void>,
-    leaf_addr: *const core::ffi::c_void,
-) {
-    crate::unwind::collect_frames(ips, root_addr, leaf_addr);
 }
 
 /// Borrowed-callchain view of a task-dump event that implements [`Encodable`]
