@@ -69,9 +69,9 @@ fn spawn_with_joinset_emits_wake_events() {
 }
 
 /// `spawn_with` flips the `TaskSpawn` `instrumented` flag for the spawn
-/// performed inside the closure, AND because the closure body lives in
-/// user code, `JoinSet::spawn`'s `#[track_caller]` resolves `spawn_loc`
-/// to the user's file (NOT the library).
+/// performed inside the closure, AND because `JoinSet::spawn` is called
+/// from that closure, its `#[track_caller]` resolves `spawn_loc` to the
+/// closure call site (NOT the library).
 #[test]
 fn spawn_with_marks_taskspawn_and_preserves_caller() {
     let dir = tempfile::tempdir().unwrap();
@@ -117,7 +117,7 @@ fn spawn_with_marks_taskspawn_and_preserves_caller() {
                         .expect("spawn_loc should resolve");
                     assert!(
                         loc.contains("spawn_with.rs"),
-                        "instrumented spawn caller should resolve to user code, got {loc}"
+                        "instrumented spawn caller should resolve to the closure call site, got {loc}"
                     );
                     instrumented_user_loc += 1;
                 }
@@ -128,7 +128,7 @@ fn spawn_with_marks_taskspawn_and_preserves_caller() {
     }
     assert_eq!(
         instrumented_user_loc, 1,
-        "expected 1 instrumented TaskSpawn pointing to spawn_with.rs"
+        "expected 1 instrumented TaskSpawn pointing to the closure call site"
     );
     assert!(raw >= 1, "expected at least 1 raw TaskSpawn, got {raw}");
 }
