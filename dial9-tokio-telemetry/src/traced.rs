@@ -202,9 +202,8 @@ impl<F: Future> Future for WakeTracked<F> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        let waker_data = this.waker_data.clone();
 
-        if !waker_data.shared.is_enabled() {
+        if !this.waker_data.shared.is_enabled() {
             return this.inner.poll(cx);
         }
 
@@ -212,9 +211,9 @@ impl<F: Future> Future for WakeTracked<F> {
         // waker fires it can forward the notification to the correct waker,
         // even if the task has been moved to a different executor thread
         // between polls.
-        waker_data.inner.register(cx.waker());
+        this.waker_data.inner.register(cx.waker());
 
-        let traced_waker = make_traced_waker(waker_data);
+        let traced_waker = make_traced_waker(this.waker_data.clone());
         let mut traced_cx = Context::from_waker(&traced_waker);
         this.inner.poll(&mut traced_cx)
     }

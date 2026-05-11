@@ -516,7 +516,7 @@ impl TelemetryHandle {
         }
     }
 
-    /// Spawn a wake-tracked future through a user-supplied spawn function.
+    /// Spawn an instrumented future through a user-supplied spawn function.
     ///
     /// `spawn_fn` is invoked synchronously with a [`TracedFuture<F>`] that
     /// the caller is expected to spawn immediately. The closure's return
@@ -613,7 +613,7 @@ impl Drop for InstrumentedSpawnGuard {
     }
 }
 
-/// Handle for spawning wake-tracked futures on a specific runtime.
+/// Handle for spawning instrumented futures on a specific runtime.
 ///
 /// Returned by [`TraceRuntimeCoreBuilder::build`]. Unlike [`TelemetryHandle::spawn`]
 /// which uses `tokio::spawn()` (requiring an ambient runtime context), this type
@@ -649,7 +649,7 @@ impl RuntimeTelemetryHandle {
         }
     }
 
-    /// Spawn a wake-tracked future through a user-supplied spawn function.
+    /// Spawn an instrumented future through a user-supplied spawn function.
     ///
     /// Mirrors [`TelemetryHandle::spawn_with`] but does not require an
     /// ambient tokio runtime context — `spawn_fn` is invoked on the
@@ -1451,7 +1451,7 @@ impl<'a> TraceRuntimeCoreBuilder<'a> {
     /// Install telemetry hooks, build the runtime, and reserve worker IDs.
     ///
     /// Returns the runtime and a [`RuntimeTelemetryHandle`] for spawning
-    /// wake-tracked futures via [`RuntimeTelemetryHandle::spawn`].
+    /// instrumented futures via [`RuntimeTelemetryHandle::spawn`].
     pub fn build(
         self,
         mut builder: tokio::runtime::Builder,

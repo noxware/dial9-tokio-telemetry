@@ -1,8 +1,8 @@
-//! Integration tests for the JoinSet-friendly tracing API:
+//! Integration tests for the custom-spawn tracing API:
 //! - [`TelemetryHandle::spawn_with`]
 //! - [`RuntimeTelemetryHandle::spawn_with`]
 //!
-//! `spawn_with(fut, |f| spawn_fn(f))` is the way to spawn a wake-tracked
+//! `spawn_with(fut, |f| spawn_fn(f))` is the way to spawn an instrumented
 //! future through APIs other than `TelemetryHandle::spawn` (e.g.
 //! `tokio::task::JoinSet::spawn`, `JoinSet::spawn_on`, etc.). It must:
 //!   - emit `WakeEvent`s for the polled future, and
@@ -116,7 +116,7 @@ fn spawn_with_marks_taskspawn_and_preserves_caller() {
                         .get(spawn_loc)
                         .expect("spawn_loc should resolve");
                     assert!(
-                        loc.contains("joinset_tracing.rs"),
+                        loc.contains("spawn_with.rs"),
                         "instrumented spawn caller should resolve to user code, got {loc}"
                     );
                     instrumented_user_loc += 1;
@@ -128,7 +128,7 @@ fn spawn_with_marks_taskspawn_and_preserves_caller() {
     }
     assert_eq!(
         instrumented_user_loc, 1,
-        "expected 1 instrumented TaskSpawn pointing to joinset_tracing.rs"
+        "expected 1 instrumented TaskSpawn pointing to spawn_with.rs"
     );
     assert!(raw >= 1, "expected at least 1 raw TaskSpawn, got {raw}");
 }
