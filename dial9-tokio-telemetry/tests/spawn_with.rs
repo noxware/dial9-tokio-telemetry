@@ -159,22 +159,36 @@ fn spawn_with_returns_closure_value() {
 /// `TaskSpawn` instrumented.
 #[test]
 fn runtime_handle_spawn_with_targets_correct_runtime() {
-    use dial9_tokio_telemetry::telemetry::{NullWriter, TelemetryCore};
+    use dial9_tokio_telemetry::telemetry::TelemetryCore;
 
-    let guard = TelemetryCore::builder().writer(NullWriter).build().unwrap();
+    let (writer, events) = common::CapturingWriter::new();
+    let guard = TelemetryCore::builder().writer(writer).build().unwrap();
     guard.enable();
 
     let mut builder_a = tokio::runtime::Builder::new_multi_thread();
     builder_a.worker_threads(1).enable_all().thread_name("rt-a");
-    let (rt_a, handle_a) = guard.trace_runtime("a").build(builder_a).unwrap();
+    let (rt_a, handle_a) = guard
+        .trace_runtime("a")
+        .task_tracking(true)
+        .build(builder_a)
+        .unwrap();
 
     let mut builder_b = tokio::runtime::Builder::new_multi_thread();
     builder_b.worker_threads(1).enable_all().thread_name("rt-b");
-    let (rt_b, handle_b) = guard.trace_runtime("b").build(builder_b).unwrap();
+    let (rt_b, handle_b) = guard
+        .trace_runtime("b")
+        .task_tracking(true)
+        .build(builder_b)
+        .unwrap();
+
+    let task_id_a: Arc<Mutex<Option<TaskId>>> = Arc::new(Mutex::new(None));
+    let task_id_b: Arc<Mutex<Option<TaskId>>> = Arc::new(Mutex::new(None));
 
     let mut set_a: JoinSet<String> = JoinSet::new();
+    let id_a = task_id_a.clone();
     handle_a.spawn_with(
-        async {
+        async move {
+            *id_a.lock().unwrap() = tokio::task::try_id().map(TaskId::from);
             tokio::task::yield_now().await;
             std::thread::current().name().unwrap_or("?").to_string()
         },
@@ -182,8 +196,10 @@ fn runtime_handle_spawn_with_targets_correct_runtime() {
     );
 
     let mut set_b: JoinSet<String> = JoinSet::new();
+    let id_b = task_id_b.clone();
     handle_b.spawn_with(
-        async {
+        async move {
+            *id_b.lock().unwrap() = tokio::task::try_id().map(TaskId::from);
             tokio::task::yield_now().await;
             std::thread::current().name().unwrap_or("?").to_string()
         },
@@ -199,4 +215,33 @@ fn runtime_handle_spawn_with_targets_correct_runtime() {
     drop(rt_a);
     drop(rt_b);
     let _ = guard.graceful_shutdown(Duration::from_secs(1));
+
+    let task_id_a = task_id_a.lock().unwrap().expect("task id a captured");
+    let task_id_b = task_id_b.lock().unwrap().expect("task id b captured");
+    let events = events.lock().unwrap();
+
+    for expected in [task_id_a, task_id_b] {
+        let saw_instrumented_spawn = events.iter().any(|event| {
+            matches!(
+                event,
+                TelemetryEvent::TaskSpawn {
+                    task_id,
+                    instrumented: Some(true),
+                    ..
+                } if *task_id == expected
+            )
+        });
+        assert!(
+            saw_instrumented_spawn,
+            "expected instrumented TaskSpawn for runtime handle task {expected:?}"
+        );
+
+        let saw_wake = events.iter().any(|event| {
+            matches!(event, TelemetryEvent::WakeEvent { woken_task_id, .. } if *woken_task_id == expected)
+        });
+        assert!(
+            saw_wake,
+            "expected WakeEvent for runtime handle task {expected:?}"
+        );
+    }
 }
