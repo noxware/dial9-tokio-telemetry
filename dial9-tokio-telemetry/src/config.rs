@@ -210,8 +210,9 @@ const DEFAULT_ENABLED: bool = false;
 const DEFAULT_TRACE_DIR: &str = "/tmp/dial9-traces";
 const DEFAULT_MAX_DISK_USAGE_MB: u64 = 1024;
 const DEFAULT_TASK_TRACKING_ENABLED: bool = true;
-const DEFAULT_CPU_PROFILE_ENABLED: bool = cfg!(target_os = "linux");
-const DEFAULT_SCHEDULE_PROFILE_ENABLED: bool = cfg!(target_os = "linux");
+const DEFAULT_CPU_PROFILE_ENABLED: bool = cfg!(all(target_os = "linux", feature = "cpu-profiling"));
+const DEFAULT_SCHEDULE_PROFILE_ENABLED: bool =
+    cfg!(all(target_os = "linux", feature = "cpu-profiling"));
 const DEFAULT_TASK_DUMP_ENABLED: bool = false;
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
@@ -517,9 +518,9 @@ impl Dial9Config {
     ///
     /// | Variable | Default | Meaning |
     /// | --- | --- | --- |
-    /// | `DIAL9_CPU_PROFILE_ENABLED` | `true` on Linux, `false` elsewhere | Enable CPU stack sampling. |
+    /// | `DIAL9_CPU_PROFILE_ENABLED` | `true` on Linux with `cpu-profiling`, `false` otherwise | Enable CPU stack sampling. |
     /// | `DIAL9_CPU_SAMPLE_HZ` | `99` | CPU sampling frequency in Hz. |
-    /// | `DIAL9_SCHEDULE_PROFILE_ENABLED` | `true` on Linux, `false` elsewhere | Enable per-worker scheduler event capture. |
+    /// | `DIAL9_SCHEDULE_PROFILE_ENABLED` | `true` on Linux with `cpu-profiling`, `false` otherwise | Enable per-worker scheduler event capture. |
     ///
     /// Supported task dump variables (capture requires the `taskdump` feature):
     ///
@@ -529,7 +530,9 @@ impl Dial9Config {
     /// | `DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS` | `10` | Mean idle duration for task dump sampling. |
     ///
     /// Missing variables use defaults. Blank, invalid, or non-Unicode values
-    /// emit a warning and are treated as missing. The returned config is built with
+    /// emit a warning and are treated as missing. Some numeric defaults come
+    /// from the underlying config builders and are listed here as the current
+    /// `from_env()` behavior. The returned config is built with
     /// [`Dial9ConfigBuilder::build_or_disabled`], so writer setup failures are
     /// logged and downgraded to a plain Tokio runtime.
     pub fn from_env() -> Self {
@@ -1046,7 +1049,6 @@ mod tests {
             .with("DIAL9_ENABLED", "true")
             .with("DIAL9_TRACE_DIR", trace_dir)
             .with("DIAL9_RUNTIME_NAME", " api-runtime ")
-            .with("DIAL9_TASK_TRACKING_ENABLED", "off")
             .with("DIAL9_TASK_DUMP_ENABLED", "true")
             .with("DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS", "25");
 

@@ -105,9 +105,9 @@ CPU profiling knobs (`cpu-profiling` feature required):
 
 | Name | Default | Meaning |
 | --- | --- | --- |
-| `DIAL9_CPU_PROFILE_ENABLED` | `true` on Linux, `false` elsewhere | Enable CPU stack sampling. |
+| `DIAL9_CPU_PROFILE_ENABLED` | `true` on Linux with `cpu-profiling`, `false` otherwise | Enable CPU stack sampling. |
 | `DIAL9_CPU_SAMPLE_HZ` | `99` | CPU sampling frequency in Hz. |
-| `DIAL9_SCHEDULE_PROFILE_ENABLED` | `true` on Linux, `false` elsewhere | Enable per-worker scheduler event capture. |
+| `DIAL9_SCHEDULE_PROFILE_ENABLED` | `true` on Linux with `cpu-profiling`, `false` otherwise | Enable per-worker scheduler event capture. |
 
 Task dump knobs (capture requires the `taskdump` feature):
 
@@ -116,7 +116,7 @@ Task dump knobs (capture requires the `taskdump` feature):
 | `DIAL9_TASK_DUMP_ENABLED` | `false` | Capture async task dumps at idle yield points. |
 | `DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS` | `10` | Mean idle duration for task dump sampling. |
 
-Missing variables use defaults. Blank, invalid, or non-Unicode values emit a warning and are treated as missing.
+Missing variables use defaults. Blank, invalid, or non-Unicode values emit a warning and are treated as missing. Some numeric defaults come from the underlying config builders and are listed here as the current `from_env()` behavior.
 
 ## Why dial9-tokio-telemetry?
 
