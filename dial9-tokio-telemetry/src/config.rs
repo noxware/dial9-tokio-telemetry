@@ -208,6 +208,8 @@ const ENV_DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS: &str = "DIAL9_TASK_DUMP_IDLE_THRESH
 
 const DEFAULT_ENABLED: bool = false;
 const DEFAULT_TRACE_DIR: &str = "/tmp/dial9-traces";
+#[cfg(feature = "worker-s3")]
+const DEFAULT_S3_PREFIX: &str = "dial9-traces";
 const DEFAULT_MAX_DISK_USAGE_MB: u64 = 1024;
 const DEFAULT_TASK_TRACKING_ENABLED: bool = true;
 const DEFAULT_CPU_PROFILE_ENABLED: bool = cfg!(all(target_os = "linux", feature = "cpu-profiling"));
@@ -541,7 +543,11 @@ fn build_s3_config(config: ParsedS3Config) -> crate::background_task::s3::S3Conf
     crate::background_task::s3::S3Config::builder()
         .bucket(config.bucket)
         .service_name(config.service_name.unwrap_or_else(default_service_name))
-        .maybe_prefix(config.prefix)
+        .prefix(
+            config
+                .prefix
+                .unwrap_or_else(|| DEFAULT_S3_PREFIX.to_string()),
+        )
         .build()
 }
 
@@ -577,7 +583,7 @@ impl Dial9Config {
     /// | --- | --- | --- |
     /// | `DIAL9_S3_BUCKET` | unset | Upload sealed trace segments to this bucket. |
     /// | `DIAL9_SERVICE_NAME` | binary name | Service name used in S3 keys and metadata. |
-    /// | `DIAL9_S3_PREFIX` | unset | Optional S3 object key prefix. |
+    /// | `DIAL9_S3_PREFIX` | `dial9-traces` | S3 object key prefix. |
     ///
     /// Supported CPU profiling variables (`cpu-profiling` feature required):
     ///
@@ -585,7 +591,7 @@ impl Dial9Config {
     /// | --- | --- | --- |
     /// | `DIAL9_CPU_PROFILE_ENABLED` | `true` on Linux with `cpu-profiling`, `false` otherwise | Enable CPU stack sampling. |
     /// | `DIAL9_CPU_SAMPLE_HZ` | `99` | CPU sampling frequency in Hz. |
-    /// | `DIAL9_SCHEDULE_PROFILE_ENABLED` | `true` on Linux with `cpu-profiling`, `false` otherwise | Enable per-worker scheduler event capture. |
+    /// | `DIAL9_SCHEDULE_PROFILE_ENABLED` | `true` on Linux with `cpu-profiling`, `false` otherwise | Enable per-worker scheduler event capture. Requires the [CPU profiling setup](https://github.com/dial9-rs/dial9/tree/main/dial9-tokio-telemetry#cpu-profiling-linux-only). |
     ///
     /// Supported task dump variables (capture requires the `taskdump` feature):
     ///
@@ -1065,6 +1071,7 @@ mod tests {
                 .get("service_name")
                 .is_some_and(|service_name| !service_name.is_empty())
         );
+        assert_eq!(metadata.get("prefix"), Some(&"dial9-traces"));
     }
 
     #[test]

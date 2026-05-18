@@ -99,7 +99,7 @@ S3 upload knobs (`worker-s3` feature required):
 | --- | --- | --- |
 | `DIAL9_S3_BUCKET` | unset | Upload sealed trace segments to this bucket. |
 | `DIAL9_SERVICE_NAME` | binary name | Service name used in S3 keys and metadata. |
-| `DIAL9_S3_PREFIX` | unset | Optional S3 object key prefix. |
+| `DIAL9_S3_PREFIX` | `dial9-traces` | S3 object key prefix. |
 
 CPU profiling knobs (`cpu-profiling` feature required):
 
@@ -107,7 +107,7 @@ CPU profiling knobs (`cpu-profiling` feature required):
 | --- | --- | --- |
 | `DIAL9_CPU_PROFILE_ENABLED` | `true` on Linux with `cpu-profiling`, `false` otherwise | Enable CPU stack sampling. |
 | `DIAL9_CPU_SAMPLE_HZ` | `99` | CPU sampling frequency in Hz. |
-| `DIAL9_SCHEDULE_PROFILE_ENABLED` | `true` on Linux with `cpu-profiling`, `false` otherwise | Enable per-worker scheduler event capture. |
+| `DIAL9_SCHEDULE_PROFILE_ENABLED` | `true` on Linux with `cpu-profiling`, `false` otherwise | Enable per-worker scheduler event capture. Requires the [CPU profiling setup](#cpu-profiling-linux-only). |
 
 Task dump knobs (capture requires the `taskdump` feature):
 
