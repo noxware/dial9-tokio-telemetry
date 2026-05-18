@@ -500,6 +500,14 @@ fn warn(message: fmt::Arguments<'_>) {
     }
 }
 
+fn error(message: fmt::Arguments<'_>) {
+    if tracing::dispatcher::has_been_set() {
+        tracing::error!(target: "dial9_telemetry", "{message}");
+    } else {
+        eprintln!("{message}");
+    }
+}
+
 fn warn_not_unicode(name: &'static str) {
     warn(format_args!("dial9: {name} is not valid Unicode; ignoring"));
 }
@@ -872,14 +880,9 @@ impl<S: dial9_config_builder::IsComplete> Dial9ConfigBuilder<S> {
 
                 debug_assert!(!is_validation, "dial9 config validation failed: {e}");
 
-                let msg = format!(
+                error(format_args!(
                     "dial9: telemetry config build failed; falling back to plain tokio runtime: {e}"
-                );
-                if tracing::dispatcher::has_been_set() {
-                    tracing::error!(target: "dial9_telemetry", "{msg}");
-                } else {
-                    eprintln!("{msg}");
-                }
+                ));
 
                 Dial9Config(Inner::Disabled {
                     tokio_configurators: cfgs_for_fallback,
