@@ -598,7 +598,7 @@ impl Dial9Config {
     /// | --- | --- | --- |
     /// | `DIAL9_CPU_PROFILE_ENABLED` | `true` on Linux with `cpu-profiling`, `false` otherwise | Enable CPU stack sampling. |
     /// | `DIAL9_CPU_SAMPLE_HZ` | `99` | CPU sampling frequency in Hz. |
-    /// | `DIAL9_SCHEDULE_PROFILE_ENABLED` | `true` on Linux with `cpu-profiling`, `false` otherwise | Enable per-worker scheduler event capture. Requires the [CPU profiling setup](https://github.com/dial9-rs/dial9/tree/main/dial9-tokio-telemetry#cpu-profiling-linux-only). |
+    /// | `DIAL9_SCHEDULE_PROFILE_ENABLED` | `true` on Linux with `cpu-profiling`, `false` otherwise | Enable per-worker scheduler event capture. Requires the [CPU profiling setup](https://github.com/dial9-rs/dial9/blob/HEAD/dial9-tokio-telemetry/README.md#cpu-profiling-linux-only). |
     ///
     /// Supported task dump variables (capture requires the `taskdump` feature):
     ///
