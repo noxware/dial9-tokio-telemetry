@@ -1084,6 +1084,18 @@ mod tests {
     }
 
     #[test]
+    fn env_s3_config_preserves_explicit_prefix() {
+        let resolved = resolve_env_config(parse_env_config(
+            &FakeEnv::default()
+                .with("DIAL9_S3_BUCKET", "b")
+                .with("DIAL9_S3_PREFIX", "custom-prefix"),
+        ));
+
+        let s3 = resolved.s3.expect("s3 config should be resolved");
+        assert_eq!(s3.prefix, "custom-prefix");
+    }
+
+    #[test]
     fn env_ignores_blank_or_invalid_values() {
         let parsed = parse_env_config(
             &FakeEnv::default()
