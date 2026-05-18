@@ -208,7 +208,6 @@ const ENV_DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS: &str = "DIAL9_TASK_DUMP_IDLE_THRESH
 
 const DEFAULT_ENABLED: bool = false;
 const DEFAULT_TRACE_DIR: &str = "/tmp/dial9-traces";
-#[cfg(feature = "worker-s3")]
 const DEFAULT_S3_PREFIX: &str = "dial9-traces";
 const DEFAULT_MAX_DISK_USAGE_MB: u64 = 1024;
 const DEFAULT_TASK_TRACKING_ENABLED: bool = true;
@@ -278,7 +277,8 @@ struct ResolvedEnvConfig {
     // Optional config: None means do not set a runtime name.
     runtime_name: Option<String>,
 
-    // Optional integration: None means do not configure S3 upload.
+    // Optional integration: None means do not configure S3 upload. When Some,
+    // env-owned S3 defaults have already been applied.
     s3: Option<ParsedS3Config>,
 
     cpu_profile_enabled: bool,
@@ -362,7 +362,11 @@ fn resolve_env_config(parsed: ParsedEnvConfig) -> ResolvedEnvConfig {
             .task_tracking_enabled
             .unwrap_or(DEFAULT_TASK_TRACKING_ENABLED),
         runtime_name: parsed.runtime_name,
-        s3: parsed.s3,
+        s3: parsed.s3.map(|mut s3| {
+            s3.prefix
+                .get_or_insert_with(|| DEFAULT_S3_PREFIX.to_string());
+            s3
+        }),
         cpu_profile_enabled: parsed
             .cpu_profile_enabled
             .unwrap_or(DEFAULT_CPU_PROFILE_ENABLED),
@@ -543,11 +547,7 @@ fn build_s3_config(config: ParsedS3Config) -> crate::background_task::s3::S3Conf
     crate::background_task::s3::S3Config::builder()
         .bucket(config.bucket)
         .service_name(config.service_name.unwrap_or_else(default_service_name))
-        .prefix(
-            config
-                .prefix
-                .unwrap_or_else(|| DEFAULT_S3_PREFIX.to_string()),
-        )
+        .maybe_prefix(config.prefix)
         .build()
 }
 
@@ -1057,12 +1057,14 @@ mod tests {
 
     #[cfg(feature = "worker-s3")]
     #[test]
-    fn env_s3_config_defaults_service_name_when_bucket_is_set() {
-        let config = build_s3_config(ParsedS3Config {
-            bucket: "b".to_string(),
-            service_name: None,
-            prefix: None,
-        });
+    fn env_s3_config_defaults_service_name_and_prefix_when_bucket_is_set() {
+        let resolved = resolve_env_config(parse_env_config(
+            &FakeEnv::default().with("DIAL9_S3_BUCKET", "b"),
+        ));
+        let s3 = resolved.s3.expect("s3 config should be resolved");
+        assert_eq!(s3.prefix.as_deref(), Some(DEFAULT_S3_PREFIX));
+
+        let config = build_s3_config(s3);
 
         let metadata: HashMap<_, _> = config.as_metadata().collect();
         assert_eq!(metadata.get("bucket"), Some(&"b"));
@@ -1071,7 +1073,7 @@ mod tests {
                 .get("service_name")
                 .is_some_and(|service_name| !service_name.is_empty())
         );
-        assert_eq!(metadata.get("prefix"), Some(&"dial9-traces"));
+        assert_eq!(metadata.get("prefix"), Some(&DEFAULT_S3_PREFIX));
     }
 
     #[test]
