@@ -263,6 +263,14 @@ struct ParsedS3Config {
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(feature = "worker-s3"), allow(dead_code))]
+struct ResolvedS3Config {
+    bucket: String,
+    service_name: Option<String>,
+    prefix: String,
+}
+
+#[derive(Debug)]
 struct ResolvedEnvConfig {
     enabled: bool,
     trace_dir: PathBuf,
@@ -277,9 +285,8 @@ struct ResolvedEnvConfig {
     // Optional config: None means do not set a runtime name.
     runtime_name: Option<String>,
 
-    // Optional integration: None means do not configure S3 upload. When Some,
-    // env-owned S3 defaults have already been applied.
-    s3: Option<ParsedS3Config>,
+    // Optional integration: None means do not configure S3 upload.
+    s3: Option<ResolvedS3Config>,
 
     cpu_profile_enabled: bool,
 
@@ -362,10 +369,10 @@ fn resolve_env_config(parsed: ParsedEnvConfig) -> ResolvedEnvConfig {
             .task_tracking_enabled
             .unwrap_or(DEFAULT_TASK_TRACKING_ENABLED),
         runtime_name: parsed.runtime_name,
-        s3: parsed.s3.map(|mut s3| {
-            s3.prefix
-                .get_or_insert_with(|| DEFAULT_S3_PREFIX.to_string());
-            s3
+        s3: parsed.s3.map(|s3| ResolvedS3Config {
+            bucket: s3.bucket,
+            service_name: s3.service_name,
+            prefix: s3.prefix.unwrap_or_else(|| DEFAULT_S3_PREFIX.to_string()),
         }),
         cpu_profile_enabled: parsed
             .cpu_profile_enabled
@@ -543,11 +550,11 @@ fn apply_runtime_env<M>(
 }
 
 #[cfg(feature = "worker-s3")]
-fn build_s3_config(config: ParsedS3Config) -> crate::background_task::s3::S3Config {
+fn build_s3_config(config: ResolvedS3Config) -> crate::background_task::s3::S3Config {
     crate::background_task::s3::S3Config::builder()
         .bucket(config.bucket)
         .service_name(config.service_name.unwrap_or_else(default_service_name))
-        .maybe_prefix(config.prefix)
+        .prefix(config.prefix)
         .build()
 }
 
@@ -1062,7 +1069,7 @@ mod tests {
             &FakeEnv::default().with("DIAL9_S3_BUCKET", "b"),
         ));
         let s3 = resolved.s3.expect("s3 config should be resolved");
-        assert_eq!(s3.prefix.as_deref(), Some(DEFAULT_S3_PREFIX));
+        assert_eq!(s3.prefix, DEFAULT_S3_PREFIX);
 
         let config = build_s3_config(s3);
 
