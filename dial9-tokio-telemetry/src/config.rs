@@ -217,7 +217,7 @@ const DEFAULT_SCHEDULE_PROFILE_ENABLED: bool =
 const DEFAULT_TASK_DUMP_ENABLED: bool = false;
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
-const MIN_MAX_FILE_SIZE: u64 = 16 * BYTES_PER_MIB;
+const MAX_FILE_SIZE_CAP: u64 = 100 * BYTES_PER_MIB;
 
 trait EnvSource {
     fn get(&self, name: &str) -> Result<String, std::env::VarError>;
@@ -475,9 +475,9 @@ impl<S: EnvSource> EnvSourceParser<S> {
 }
 
 fn derive_max_file_size(max_total_size: u64) -> u64 {
-    // Keep size-based rotation as a safety valve: roughly four large segments
-    // fit in the disk budget, but avoid tiny files on very small budgets.
-    (max_total_size / 4).max(MIN_MAX_FILE_SIZE)
+    // Keep size-based rotation as a safety valve without allowing huge
+    // segments when the total disk budget is large.
+    (max_total_size / 4).min(MAX_FILE_SIZE_CAP)
 }
 
 #[cfg(feature = "worker-s3")]
@@ -583,7 +583,7 @@ impl Dial9Config {
     /// | `DIAL9_TRACE_DIR` | `/tmp/dial9-traces` | Directory for rotated trace segments. |
     /// | `DIAL9_ROTATION_SECS` | `60` | Wall-clock rotation period in seconds. |
     /// | `DIAL9_MAX_DISK_USAGE_MB` | `1024` | Total on-disk trace budget in MiB. |
-    /// | `DIAL9_MAX_FILE_SIZE_MB` | `max(total / 4, 16)` | Per-file trace segment size in MiB. |
+    /// | `DIAL9_MAX_FILE_SIZE_MB` | `min(100, total / 4)` | Per-file trace segment size in MiB. |
     ///
     /// Supported runtime variables:
     ///
@@ -1002,6 +1002,19 @@ mod tests {
         assert_eq!(resolved.rotation_period, None);
         assert_eq!(resolved.cpu_sample_hz, None);
         assert_eq!(resolved.task_dump_idle_threshold, None);
+    }
+
+    #[test]
+    fn env_default_max_file_size_caps_large_budgets_at_100_mib() {
+        assert_eq!(
+            derive_max_file_size(1024 * BYTES_PER_MIB),
+            100 * BYTES_PER_MIB
+        );
+    }
+
+    #[test]
+    fn env_default_max_file_size_uses_quarter_of_small_budgets() {
+        assert_eq!(derive_max_file_size(64 * BYTES_PER_MIB), 16 * BYTES_PER_MIB);
     }
 
     #[test]

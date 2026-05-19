@@ -84,7 +84,7 @@ async fn main() {
 | `DIAL9_TRACE_DIR` | `/tmp/dial9-traces` | Directory for rotated trace segments. |
 | `DIAL9_ROTATION_SECS` | `60` | Wall-clock rotation period in seconds. |
 | `DIAL9_MAX_DISK_USAGE_MB` | `1024` | Total on-disk trace budget in MiB. |
-| `DIAL9_MAX_FILE_SIZE_MB` | `max(total / 4, 16)` | Per-file trace segment size in MiB. |
+| `DIAL9_MAX_FILE_SIZE_MB` | `min(100, total / 4)` | Per-file trace segment size in MiB. |
 
 Runtime knobs:
 
