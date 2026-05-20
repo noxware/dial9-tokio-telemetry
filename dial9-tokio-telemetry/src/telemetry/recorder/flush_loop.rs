@@ -1,6 +1,7 @@
 use crate::metrics::{FlushMetrics, Operation, TlDrainMetrics};
 use crate::rate_limit::rate_limited;
 use crate::telemetry::buffer;
+use crate::telemetry::writer::TraceWriter;
 use metrique::timers::Timer;
 use metrique::unit::Microsecond;
 use metrique::unit_of_work::metrics;
@@ -8,7 +9,6 @@ use metrique_timesource::time_source;
 use std::time::Duration;
 
 use super::ControlCommand;
-use super::event_writer::EventWriter;
 use super::shared_state::SharedState;
 
 /// Tracks the drain coordination state between the flush loop and the writer.
@@ -44,18 +44,19 @@ pub(crate) struct FlushStats {
 
 /// Perform one flush cycle: drain CPU profilers, drain the collector, write
 /// events to disk, and flush the writer. This is the only code path that
-/// touches EventWriter, and it runs exclusively on the flush thread.
+/// touches the writer, and it runs exclusively on the flush thread.
 pub(super) fn flush_once(
-    event_writer: &mut EventWriter,
+    writer: &mut dyn TraceWriter,
+    events_written: &mut u64,
     shared: &SharedState,
     drain_self: bool,
 ) -> FlushStats {
     use crate::primitives::sync::atomic::Ordering;
 
-    let events_before = event_writer.events_written();
+    let events_before = *events_written;
     let cpu_events_time = std::time::Instant::now();
     if shared.is_enabled() {
-        event_writer.flush_sources(shared);
+        shared.flush_sources();
     }
     let cpu_flush_duration = cpu_events_time.elapsed();
 
@@ -77,27 +78,28 @@ pub(super) fn flush_once(
     }
 
     while let Some(batch) = shared.collector.next() {
-        if batch.event_count > 0
-            && let Err(e) = event_writer.write_encoded_batch(&batch)
-        {
-            rate_limited!(Duration::from_secs(60), {
-                tracing::warn!("failed to transcode batch: {e}");
-            });
-            shared.enabled.store(false, Ordering::Relaxed);
-            return FlushStats {
-                event_count: event_writer.events_written() - events_before,
-                dropped_batches: dropped as u64,
-                cpu_flush_duration,
-            };
+        if batch.event_count > 0 {
+            if let Err(e) = writer.write_encoded_batch(&batch) {
+                rate_limited!(Duration::from_secs(60), {
+                    tracing::warn!("failed to transcode batch: {e}");
+                });
+                shared.enabled.store(false, Ordering::Relaxed);
+                return FlushStats {
+                    event_count: *events_written - events_before,
+                    dropped_batches: dropped as u64,
+                    cpu_flush_duration,
+                };
+            }
+            *events_written += batch.event_count;
         }
     }
-    if let Err(e) = event_writer.flush() {
+    if let Err(e) = writer.flush() {
         rate_limited!(Duration::from_secs(60), {
             tracing::warn!("failed to flush trace data: {e}");
         });
     }
     FlushStats {
-        event_count: event_writer.events_written() - events_before,
+        event_count: *events_written - events_before,
         dropped_batches: dropped as u64,
         cpu_flush_duration,
     }
@@ -108,19 +110,20 @@ pub(super) fn run_flush_loop(
     control_rx: crate::primitives::sync::mpsc::Receiver<ControlCommand>,
     shared: &SharedState,
     flush_metrics_sink: &metrique_writer::BoxEntrySink,
-    mut event_writer: EventWriter,
+    mut writer: Box<dyn TraceWriter>,
 ) {
     // Drain the flush thread's own TL buffer every ~1s (200 × 5ms)
     // rather than every cycle, so queue samples and CPU events
     // are batched into reasonably-sized segments.
     let mut cycle_count: u64 = 0;
     const SELF_DRAIN_INTERVAL: u64 = 200;
+    let mut events_written: u64 = 0;
 
     let sample_interval = Duration::from_millis(10);
     let mut last_sample = time_source().instant();
     // Snapshot the user-provided segment metadata so we can
     // merge it with runtime→worker entries on each flush cycle.
-    let static_metadata = event_writer.segment_metadata().to_vec();
+    let static_metadata = writer.segment_metadata().to_vec();
 
     let mut drain_state = DrainState::Idle;
 
@@ -164,7 +167,7 @@ pub(super) fn run_flush_loop(
         if !runtime_entries.is_empty() {
             let mut merged = static_metadata.clone();
             merged.extend(runtime_entries);
-            event_writer.update_segment_metadata(merged);
+            writer.update_segment_metadata(merged);
         }
 
         cycle_count += 1;
@@ -182,7 +185,7 @@ pub(super) fn run_flush_loop(
         // forever reschedule the drain and never reach the drained step.
         let do_drain = match drain_state {
             DrainState::Idle => {
-                if !exit && event_writer.should_drain() {
+                if !exit && writer.should_drain() {
                     shared.bump_drain_epoch();
                     drain_state = DrainState::EpochBumped;
                 }
@@ -214,7 +217,7 @@ pub(super) fn run_flush_loop(
             .append_on_drop(flush_metrics_sink.clone());
         }
         let mut flush_timer = Timer::start_now();
-        let stats = flush_once(&mut event_writer, shared, drain_self);
+        let stats = flush_once(&mut *writer, &mut events_written, shared, drain_self);
         flush_timer.stop();
 
         // Notify the writer that TL buffers have been drained and flushed.
@@ -222,7 +225,7 @@ pub(super) fn run_flush_loop(
         // Skip on exit — finalize() below will seal the final segment.
         if do_drain
             && !exit
-            && let Err(e) = event_writer.drained()
+            && let Err(e) = writer.drained()
         {
             rate_limited!(Duration::from_secs(60), {
                 tracing::warn!("failed to complete post-drain action: {e}");
@@ -246,7 +249,7 @@ pub(super) fn run_flush_loop(
         if exit {
             // Write final metadata before sealing so single-segment
             // traces contain runtime→worker mappings.
-            if let Err(e) = event_writer.write_current_segment_metadata() {
+            if let Err(e) = writer.write_current_segment_metadata() {
                 rate_limited!(Duration::from_secs(60), {
                     tracing::warn!("failed to write final segment metadata: {e}");
                 });
@@ -254,7 +257,7 @@ pub(super) fn run_flush_loop(
                     g.write_metadata_failed = true;
                 }
             }
-            if let Err(e) = event_writer.finalize() {
+            if let Err(e) = writer.finalize() {
                 rate_limited!(Duration::from_secs(60), {
                     tracing::warn!("failed to finalize trace segment: {e}");
                 });
