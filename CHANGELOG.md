@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.12](https://github.com/noxware/dial9-tokio-telemetry/compare/dial9-tokio-telemetry-v0.3.11...dial9-tokio-telemetry-v0.3.12) - 2026-05-26
+
+### Added
+
+- Analysis toolkit for memory profiling [stacked] ([#443](https://github.com/noxware/dial9-tokio-telemetry/pull/443))
+- add `Dial9Allocator`, a profiling allocator that feeds events into dial9 traces ([#442](https://github.com/noxware/dial9-tokio-telemetry/pull/442))
+
+### Other
+
+- add Deserialize impl for dial9-trace-format ([#447](https://github.com/noxware/dial9-tokio-telemetry/pull/447))
+
 ## [0.3.11](https://github.com/dial9-rs/dial9/compare/dial9-tokio-telemetry-v0.3.10...dial9-tokio-telemetry-v0.3.11) - 2026-05-22
 
 ### Added
