@@ -195,6 +195,7 @@ const ENV_DIAL9_TRACE_DIR: &str = "DIAL9_TRACE_DIR";
 const ENV_DIAL9_ROTATION_SECS: &str = "DIAL9_ROTATION_SECS";
 const ENV_DIAL9_MAX_DISK_USAGE_MB: &str = "DIAL9_MAX_DISK_USAGE_MB";
 const ENV_DIAL9_MAX_FILE_SIZE_MB: &str = "DIAL9_MAX_FILE_SIZE_MB";
+const ENV_DIAL9_TOKIO_INSTRUMENTATION_ENABLED: &str = "DIAL9_TOKIO_INSTRUMENTATION_ENABLED";
 const ENV_DIAL9_TASK_TRACKING_ENABLED: &str = "DIAL9_TASK_TRACKING_ENABLED";
 const ENV_DIAL9_RUNTIME_NAME: &str = "DIAL9_RUNTIME_NAME";
 const ENV_DIAL9_S3_BUCKET: &str = "DIAL9_S3_BUCKET";
@@ -244,6 +245,7 @@ struct ParsedEnvConfig {
     rotation_period: Option<Duration>,
     max_total_size: Option<u64>,
     max_file_size: Option<u64>,
+    tokio_instrumentation_enabled: Option<bool>,
     task_tracking_enabled: Option<bool>,
     runtime_name: Option<String>,
     s3: Option<ParsedS3Config>,
@@ -280,6 +282,7 @@ struct ResolvedEnvConfig {
 
     max_total_size: u64,
     max_file_size: u64,
+    tokio_instrumentation_enabled: Option<bool>,
     task_tracking_enabled: bool,
 
     // Optional config: None means do not set a runtime name.
@@ -301,6 +304,7 @@ struct ResolvedEnvConfig {
 }
 
 struct RuntimeEnvConfig {
+    tokio_instrumentation_enabled: Option<bool>,
     task_tracking_enabled: bool,
     runtime_name: Option<String>,
     cpu_profile_enabled: bool,
@@ -336,6 +340,7 @@ fn parse_env_config(env: &impl EnvSource) -> ParsedEnvConfig {
             .map(Duration::from_secs),
         max_total_size,
         max_file_size,
+        tokio_instrumentation_enabled: env.get_bool(ENV_DIAL9_TOKIO_INSTRUMENTATION_ENABLED),
         task_tracking_enabled: env.get_bool(ENV_DIAL9_TASK_TRACKING_ENABLED),
         runtime_name: env.get_string(ENV_DIAL9_RUNTIME_NAME),
         s3,
@@ -365,6 +370,7 @@ fn resolve_env_config(parsed: ParsedEnvConfig) -> ResolvedEnvConfig {
         rotation_period: parsed.rotation_period,
         max_total_size,
         max_file_size,
+        tokio_instrumentation_enabled: parsed.tokio_instrumentation_enabled,
         task_tracking_enabled: parsed
             .task_tracking_enabled
             .unwrap_or(DEFAULT_TASK_TRACKING_ENABLED),
@@ -519,6 +525,9 @@ fn apply_runtime_env<M>(
     if let Some(name) = config.runtime_name {
         runtime = runtime.with_runtime_name(name);
     }
+    if let Some(enabled) = config.tokio_instrumentation_enabled {
+        runtime = runtime.with_tokio_instrumentation(enabled);
+    }
     runtime = runtime.with_task_tracking(config.task_tracking_enabled);
 
     if config.task_dump_enabled {
@@ -590,6 +599,7 @@ impl Dial9Config {
     /// | Variable | Default | Meaning |
     /// | --- | --- | --- |
     /// | `DIAL9_TASK_TRACKING_ENABLED` | `true` | Track tasks spawned through dial9 handles. |
+    /// | `DIAL9_TOKIO_INSTRUMENTATION_ENABLED` | `true` | Install dial9's Tokio runtime hook instrumentation. |
     /// | `DIAL9_RUNTIME_NAME` | unset | Human-readable runtime name in trace metadata. |
     ///
     /// Supported S3 variables (`worker-s3` feature required):
@@ -632,6 +642,7 @@ impl Dial9Config {
             rotation_period,
             max_total_size,
             max_file_size,
+            tokio_instrumentation_enabled,
             task_tracking_enabled,
             runtime_name,
             s3,
@@ -643,6 +654,7 @@ impl Dial9Config {
         } = resolve_env_config(parse_env_config(env));
 
         let runtime_config = RuntimeEnvConfig {
+            tokio_instrumentation_enabled,
             task_tracking_enabled,
             runtime_name,
             cpu_profile_enabled,
@@ -971,6 +983,7 @@ mod tests {
         assert_eq!(parsed.rotation_period, None);
         assert_eq!(parsed.max_total_size, None);
         assert_eq!(parsed.max_file_size, None);
+        assert_eq!(parsed.tokio_instrumentation_enabled, None);
         assert_eq!(parsed.task_tracking_enabled, None);
         assert_eq!(parsed.runtime_name, None);
         assert!(parsed.s3.is_none());
@@ -1000,6 +1013,7 @@ mod tests {
             resolved.task_tracking_enabled,
             DEFAULT_TASK_TRACKING_ENABLED
         );
+        assert_eq!(resolved.tokio_instrumentation_enabled, None);
         assert_eq!(resolved.cpu_profile_enabled, supported_profiling);
         assert_eq!(resolved.schedule_profile_enabled, supported_profiling);
         assert_eq!(resolved.task_dump_enabled, DEFAULT_TASK_DUMP_ENABLED);
@@ -1048,6 +1062,7 @@ mod tests {
     fn env_parses_runtime_storage_s3_cpu_and_taskdump_values() {
         let parsed = parse_env_config(
             &FakeEnv::default()
+                .with("DIAL9_TOKIO_INSTRUMENTATION_ENABLED", "off")
                 .with("DIAL9_TASK_TRACKING_ENABLED", "off")
                 .with("DIAL9_RUNTIME_NAME", " api-runtime ")
                 .with("DIAL9_MAX_FILE_SIZE_MB", "128")
@@ -1061,6 +1076,7 @@ mod tests {
                 .with("DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS", "25"),
         );
 
+        assert_eq!(parsed.tokio_instrumentation_enabled, Some(false));
         assert_eq!(parsed.task_tracking_enabled, Some(false));
         assert_eq!(parsed.runtime_name.as_deref(), Some("api-runtime"));
         assert_eq!(parsed.max_file_size, Some(128 * 1024 * 1024));
@@ -1126,6 +1142,7 @@ mod tests {
         let parsed = parse_env_config(
             &FakeEnv::default()
                 .with("DIAL9_ENABLED", "maybe")
+                .with("DIAL9_TOKIO_INSTRUMENTATION_ENABLED", "maybe")
                 .with("DIAL9_TRACE_DIR", "   ")
                 .with("DIAL9_ROTATION_SECS", "0")
                 .with("DIAL9_MAX_DISK_USAGE_MB", "wat")
@@ -1137,6 +1154,7 @@ mod tests {
         );
 
         assert_eq!(parsed.enabled, None);
+        assert_eq!(parsed.tokio_instrumentation_enabled, None);
         assert_eq!(parsed.trace_dir, None);
         assert_eq!(parsed.rotation_period, None);
         assert_eq!(parsed.max_total_size, None);
@@ -1206,6 +1224,34 @@ mod tests {
         assert_eq!(
             shared.task_dump_idle_threshold_ns.load(Ordering::Relaxed),
             25_000_000
+        );
+    }
+
+    #[test]
+    fn env_config_can_disable_tokio_instrumentation_without_disabling_telemetry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let trace_dir = dir.path().to_str().expect("utf8 tempdir");
+        let env = FakeEnv::default()
+            .with("DIAL9_ENABLED", "true")
+            .with("DIAL9_TRACE_DIR", trace_dir)
+            .with("DIAL9_TOKIO_INSTRUMENTATION_ENABLED", "false");
+
+        let cfg = Dial9Config::from_env_source(&env);
+        let rt = TracedRuntime::try_new(cfg).expect("runtime should build");
+        assert!(rt.guard().is_enabled(), "telemetry should remain enabled");
+        assert!(
+            rt.guard()
+                .shared()
+                .expect("telemetry should be enabled")
+                .contexts
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "no Tokio runtime contexts should be registered when Tokio instrumentation is disabled"
+        );
+        assert!(
+            !rt.block_on(async { crate::telemetry::TelemetryHandle::current().is_enabled() }),
+            "TelemetryHandle::current() should remain inert without Tokio hooks"
         );
     }
 

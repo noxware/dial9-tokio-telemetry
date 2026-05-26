@@ -91,6 +91,7 @@ Runtime knobs:
 | Name | Default | Meaning |
 | --- | --- | --- |
 | `DIAL9_TASK_TRACKING_ENABLED` | `true` | Track tasks spawned through dial9 handles. |
+| `DIAL9_TOKIO_INSTRUMENTATION_ENABLED` | `true` | Install dial9's Tokio runtime hook instrumentation. |
 | `DIAL9_RUNTIME_NAME` | unset | Human-readable runtime name in trace metadata. |
 
 S3 upload knobs (`worker-s3` feature required):
@@ -213,6 +214,30 @@ Dial9Config::builder()
     })
     // ...
 ```
+
+To use dial9 as a CPU profiler without installing Tokio runtime hooks, keep
+telemetry enabled and disable only Tokio instrumentation:
+
+```rust,ignore
+use dial9_tokio_telemetry::telemetry::cpu_profile::CpuProfilingConfig;
+use dial9_tokio_telemetry::telemetry::TracedRuntime;
+
+let (runtime, guard) = TracedRuntime::builder()
+    .with_cpu_profiling(CpuProfilingConfig::default())
+    .with_tokio_instrumentation(false)
+    .build_and_start(tokio::runtime::Builder::new_multi_thread(), writer)?;
+```
+
+Equivalent env config:
+
+```text
+DIAL9_ENABLED=true
+DIAL9_CPU_PROFILE_ENABLED=true
+DIAL9_TOKIO_INSTRUMENTATION_ENABLED=false
+```
+
+In this mode, dial9 does not install Tokio runtime hooks. APIs that depend on
+those hooks will not observe runtime context.
 
 #### System requirements
 - `perf_event_paranoid`: CPU profiling requires <= 2. `sched_events` requires <= 1.
