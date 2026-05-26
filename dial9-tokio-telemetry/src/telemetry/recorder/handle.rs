@@ -38,6 +38,7 @@ pub struct TelemetryHandle {
 struct HandleInner {
     shared: Arc<SharedState>,
     control_tx: crate::primitives::sync::mpsc::SyncSender<ControlCommand>,
+    tokio_instrumentation_enabled: bool,
 }
 
 impl std::fmt::Debug for TelemetryHandle {
@@ -54,8 +55,25 @@ impl TelemetryHandle {
         control_tx: crate::primitives::sync::mpsc::SyncSender<ControlCommand>,
     ) -> Self {
         Self {
-            inner: Some(HandleInner { shared, control_tx }),
+            inner: Some(HandleInner {
+                shared,
+                control_tx,
+                tokio_instrumentation_enabled: true,
+            }),
         }
+    }
+
+    pub(crate) fn with_tokio_instrumentation_enabled(mut self, enabled: bool) -> Self {
+        if let Some(inner) = &mut self.inner {
+            inner.tokio_instrumentation_enabled = enabled;
+        }
+        self
+    }
+
+    pub(crate) fn clear_current() {
+        CURRENT_HANDLE.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
     }
 
     /// Return an inert handle that is not connected to any telemetry
@@ -137,8 +155,11 @@ impl TelemetryHandle {
     /// Get a [`TracedHandle`](crate::traced::TracedHandle) for wrapping
     /// futures with wake tracking, or `None` on a disabled handle.
     pub(crate) fn traced_handle(&self) -> Option<crate::traced::TracedHandle> {
-        self.inner.as_ref().map(|i| crate::traced::TracedHandle {
-            shared: i.shared.clone(),
+        self.inner.as_ref().and_then(|i| {
+            i.tokio_instrumentation_enabled
+                .then(|| crate::traced::TracedHandle {
+                    shared: i.shared.clone(),
+                })
         })
     }
 

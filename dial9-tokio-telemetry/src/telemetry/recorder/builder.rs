@@ -50,6 +50,7 @@ pub(super) enum PipelineConfig {
 /// Builder for configuring a traced Tokio runtime.
 pub struct TracedRuntimeBuilder<P = NoTracePath, M = PipelineUnset> {
     pub(super) enabled: bool,
+    pub(super) tokio_instrumentation_enabled: bool,
     pub(super) task_tracking_enabled: bool,
     pub(super) task_dump_config: Option<crate::telemetry::task_dump_config::TaskDumpConfig>,
     pub(super) trace_path: Option<PathBuf>,
@@ -92,6 +93,19 @@ impl<P, M> TracedRuntimeBuilder<P, M> {
     /// Enable or disable task spawn/terminate tracking.
     pub fn with_task_tracking(mut self, enabled: bool) -> Self {
         self.task_tracking_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable dial9's Tokio runtime instrumentation.
+    ///
+    /// Defaults to `true`. Set this to `false` to build the Tokio runtime
+    /// without dial9's Tokio hook instrumentation.
+    ///
+    /// User callbacks registered with [`with_tokio_hooks`](Self::with_tokio_hooks)
+    /// are part of this instrumentation path and are not installed when this
+    /// is `false`.
+    pub fn with_tokio_instrumentation(mut self, enabled: bool) -> Self {
+        self.tokio_instrumentation_enabled = enabled;
         self
     }
 
@@ -172,7 +186,8 @@ impl<P, M> TracedRuntimeBuilder<P, M> {
 
     /// Configure user-provided callbacks to run alongside dial9's internal
     /// Tokio runtime hooks. dial9's logic always runs first, then the user
-    /// callbacks fire in registration order.
+    /// callbacks fire in registration order. These callbacks are not installed
+    /// when Tokio instrumentation is disabled.
     ///
     /// This method can be called multiple times; each call receives a mutable
     /// reference to the same `TokioHooks` instance. Registering the same hook
@@ -192,6 +207,10 @@ impl<P, M> TracedRuntimeBuilder<P, M> {
     /// from the original `TelemetryGuard`. Only the tokio callbacks are
     /// registered on the new builder. The new runtime's workers get a unique
     /// runtime index so their `WorkerId`s don't collide with existing runtimes.
+    ///
+    /// If [`with_tokio_instrumentation(false)`](Self::with_tokio_instrumentation)
+    /// was set, this builds a plain runtime and does not attach runtime
+    /// context or hooks to the existing telemetry session.
     pub fn build_and_attach_to_telemetry(
         self,
         mut builder: tokio::runtime::Builder,
@@ -200,8 +219,15 @@ impl<P, M> TracedRuntimeBuilder<P, M> {
         let (Some(shared), Some(control_tx)) = (guard.shared(), guard.control_tx()) else {
             // Disabled guard: produce a plain tokio runtime with no
             // telemetry hooks so attaching still works gracefully.
+            TelemetryHandle::clear_current();
             return builder.build();
         };
+
+        if !self.tokio_instrumentation_enabled {
+            TelemetryHandle::clear_current();
+            return builder.build();
+        }
+
         attach_runtime(
             shared,
             builder,
@@ -215,6 +241,7 @@ impl<P, M> TracedRuntimeBuilder<P, M> {
     pub(super) fn into_state<Q, N>(self) -> TracedRuntimeBuilder<Q, N> {
         TracedRuntimeBuilder {
             enabled: self.enabled,
+            tokio_instrumentation_enabled: self.tokio_instrumentation_enabled,
             task_tracking_enabled: self.task_tracking_enabled,
             task_dump_config: self.task_dump_config,
             trace_path: self.trace_path,
@@ -427,7 +454,7 @@ impl<M> TracedRuntimeBuilder<HasTracePath, M> {
 
     fn build_inner(
         self,
-        builder: tokio::runtime::Builder,
+        mut builder: tokio::runtime::Builder,
         writer: Box<dyn TraceWriter>,
     ) -> std::io::Result<(tokio::runtime::Runtime, TelemetryGuard)> {
         if !self.enabled {
@@ -454,7 +481,16 @@ impl<M> TracedRuntimeBuilder<HasTracePath, M> {
             .maybe_cpu_profiling(self.cpu_profiling_config)
             .maybe_sched_events(self.sched_event_config);
 
-        let guard = core_builder.build()?;
+        let guard = core_builder
+            .build()?
+            .with_tokio_instrumentation_enabled(self.tokio_instrumentation_enabled);
+
+        if !self.tokio_instrumentation_enabled {
+            TelemetryHandle::clear_current();
+            let runtime = builder.build()?;
+            return Ok((runtime, guard));
+        }
+
         let control_tx = guard
             .control_tx()
             .expect("TelemetryCore::builder().build() always returns an enabled guard")
@@ -799,6 +835,7 @@ impl TracedRuntime {
     pub fn builder() -> TracedRuntimeBuilder<NoTracePath, PipelineUnset> {
         TracedRuntimeBuilder {
             enabled: true,
+            tokio_instrumentation_enabled: true,
             task_tracking_enabled: false,
             task_dump_config: None,
             trace_path: None,
@@ -823,6 +860,7 @@ impl TracedRuntime {
     pub fn build_disabled(
         mut builder: tokio::runtime::Builder,
     ) -> std::io::Result<(tokio::runtime::Runtime, TelemetryGuard)> {
+        TelemetryHandle::clear_current();
         let runtime = builder.build()?;
         Ok((runtime, TelemetryGuard::disabled()))
     }

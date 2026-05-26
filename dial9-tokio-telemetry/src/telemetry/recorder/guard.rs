@@ -61,6 +61,16 @@ impl TelemetryGuard {
         }
     }
 
+    pub(crate) fn with_tokio_instrumentation_enabled(mut self, enabled: bool) -> Self {
+        if let GuardInner::Enabled(eg) = &mut self.inner {
+            eg.handle = eg
+                .handle
+                .clone()
+                .with_tokio_instrumentation_enabled(enabled);
+        }
+        self
+    }
+
     pub(crate) fn disabled() -> Self {
         Self {
             inner: GuardInner::Disabled,
@@ -150,6 +160,7 @@ impl TelemetryGuard {
             guard: self,
             name: name.into(),
             task_tracking: false,
+            tokio_instrumentation_enabled: true,
             tokio_hooks: super::TokioHooks::default(),
         }
     }
@@ -258,6 +269,7 @@ pub struct TraceRuntimeCoreBuilder<'a> {
     guard: &'a TelemetryGuard,
     name: String,
     task_tracking: bool,
+    tokio_instrumentation_enabled: bool,
     tokio_hooks: super::TokioHooks,
 }
 
@@ -269,9 +281,21 @@ impl<'a> TraceRuntimeCoreBuilder<'a> {
         self
     }
 
+    /// Enable or disable dial9's Tokio runtime instrumentation for this runtime.
+    /// Defaults to `true`.
+    ///
+    /// User callbacks registered with [`with_tokio_hooks`](Self::with_tokio_hooks)
+    /// are part of this instrumentation path and are not installed when this
+    /// is `false`.
+    pub fn with_tokio_instrumentation(mut self, enabled: bool) -> Self {
+        self.tokio_instrumentation_enabled = enabled;
+        self
+    }
+
     /// Configure user-provided callbacks to run alongside dial9's internal
     /// Tokio runtime hooks. dial9's logic always runs first, then the user
-    /// callbacks fire in registration order.
+    /// callbacks fire in registration order. These callbacks are not installed
+    /// when Tokio instrumentation is disabled.
     pub fn with_tokio_hooks<F>(mut self, f: F) -> Self
     where
         F: FnOnce(&mut super::TokioHooks),
@@ -288,11 +312,8 @@ impl<'a> TraceRuntimeCoreBuilder<'a> {
         self,
         mut builder: tokio::runtime::Builder,
     ) -> std::io::Result<(tokio::runtime::Runtime, RuntimeTelemetryHandle)> {
-        let (Some(shared), Some(control_tx), Some(traced)) = (
-            self.guard.shared(),
-            self.guard.control_tx(),
-            self.guard.handle().traced_handle(),
-        ) else {
+        let (Some(shared), Some(control_tx)) = (self.guard.shared(), self.guard.control_tx())
+        else {
             // Disabled guard: build a plain tokio runtime and return a
             // RuntimeTelemetryHandle that effectively short-circuits to
             // tokio::spawn.
@@ -303,6 +324,16 @@ impl<'a> TraceRuntimeCoreBuilder<'a> {
             };
             return Ok((runtime, handle));
         };
+
+        if !self.tokio_instrumentation_enabled {
+            let runtime = builder.build()?;
+            let handle = RuntimeTelemetryHandle {
+                runtime: runtime.handle().clone(),
+                traced: None,
+            };
+            return Ok((runtime, handle));
+        }
+
         let runtime = attach_runtime(
             shared,
             builder,
@@ -313,7 +344,9 @@ impl<'a> TraceRuntimeCoreBuilder<'a> {
         )?;
         let handle = RuntimeTelemetryHandle {
             runtime: runtime.handle().clone(),
-            traced: Some(traced),
+            traced: Some(crate::traced::TracedHandle {
+                shared: shared.clone(),
+            }),
         };
         Ok((runtime, handle))
     }
