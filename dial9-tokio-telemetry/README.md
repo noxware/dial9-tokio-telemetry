@@ -228,6 +228,10 @@ let (runtime, guard) = TracedRuntime::builder()
     .build_and_start(tokio::runtime::Builder::new_multi_thread(), writer)?;
 ```
 
+You can also use `TelemetryCore::builder()` directly when you only need the
+telemetry session and want to decide separately whether to build or attach any
+Tokio runtime.
+
 Equivalent env config:
 
 ```text
