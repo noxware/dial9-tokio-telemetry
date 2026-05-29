@@ -648,7 +648,7 @@ impl Dial9Config {
     /// | Variable | Default | Meaning |
     /// | --- | --- | --- |
     /// | `DIAL9_PROCESS_RESOURCE_USAGE_ENABLED` | `true` on Unix, `false` otherwise | Enable process resource usage sampling from `getrusage(RUSAGE_SELF)`. |
-    /// | `DIAL9_PROCESS_RESOURCE_USAGE_SAMPLE_INTERVAL_MS` | `1000` | Sampling interval in milliseconds. |
+    /// | `DIAL9_PROCESS_RESOURCE_USAGE_SAMPLE_INTERVAL_MS` | `100` | Sampling interval in milliseconds. |
     ///
     /// Supported task dump variables (capture requires the `taskdump` feature):
     ///

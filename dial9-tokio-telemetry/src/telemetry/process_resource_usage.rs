@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Configuration for process resource usage sampling.
 ///
@@ -10,7 +10,7 @@ const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// [`TracedRuntimeBuilder::with_process_resource_usage`](crate::telemetry::TracedRuntimeBuilder::with_process_resource_usage).
 #[derive(Debug, Clone, bon::Builder)]
 pub struct ProcessResourceUsageConfig {
-    /// Minimum time between samples. Defaults to 1 second.
+    /// Minimum time between samples.
     #[builder(default = DEFAULT_SAMPLE_INTERVAL)]
     sample_interval: Duration,
 }
@@ -303,7 +303,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_sample_interval_is_one_second() {
+    fn default_sample_interval_is_100ms() {
         assert_eq!(
             ProcessResourceUsageConfig::default().sample_interval(),
             DEFAULT_SAMPLE_INTERVAL
