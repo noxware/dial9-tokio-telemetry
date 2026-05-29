@@ -492,10 +492,13 @@ mod tests {
 
         // ── Decode ──────────────────────────────────────────────────────────
         let bytes = enc.finish();
-        let mut dec = Decoder::new(&bytes).expect("valid trace header");
+        let mut dec = Decoder::new(&bytes).expect("synthetic trace should have a valid header");
         let mut events: Vec<Dial9Event> = Vec::new();
         dec.for_each_event(|raw| {
-            events.push(raw.deserialize().expect("deserialize event"));
+            events.push(
+                raw.deserialize()
+                    .expect("synthetic event should deserialize"),
+            );
         })
         .expect("decode");
 

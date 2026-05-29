@@ -205,6 +205,7 @@ mod unix {
         }
 
         #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
         struct DecodedProcessResourceUsageEvent {
             timestamp_ns: u64,
             user_cpu_ns: u64,
@@ -221,21 +222,27 @@ mod unix {
         fn decode_process_resource_usage_events(
             bytes: &[u8],
         ) -> Vec<DecodedProcessResourceUsageEvent> {
-            let mut decoder =
-                dial9_trace_format::decoder::Decoder::new(bytes).expect("valid trace header");
+            let mut decoder = dial9_trace_format::decoder::Decoder::new(bytes)
+                .expect("encoded process resource usage batch should have a valid trace header");
             let mut events = Vec::new();
             decoder
-                .for_each_event(|raw| match raw.deserialize().expect("deserialize event") {
-                    DecodedEvent::ProcessResourceUsageEvent(event) => events.push(event),
-                    DecodedEvent::Other => {}
+                .for_each_event(|raw| {
+                    match raw
+                        .deserialize()
+                        .expect("encoded process resource usage event should deserialize")
+                    {
+                        DecodedEvent::ProcessResourceUsageEvent(event) => events.push(event),
+                        DecodedEvent::Other => {}
+                    }
                 })
-                .expect("decode events");
+                .expect("encoded process resource usage batch should decode");
             events
         }
 
         #[test]
         fn read_process_resource_usage_returns_metrics() {
-            let snapshot = read_process_resource_usage().expect("getrusage succeeds");
+            let snapshot = read_process_resource_usage()
+                .expect("getrusage should succeed for the current process");
             assert!(snapshot.max_rss_bytes > 0);
         }
 
@@ -253,22 +260,12 @@ mod unix {
             source.flush(&ctx);
             buffer::drain_to_collector(&shared.collector);
 
-            let batch = shared.collector.next().expect("source emitted a batch");
+            let batch = shared.collector.next().expect("source should emit a batch");
             let events = decode_process_resource_usage_events(batch.encoded_bytes());
 
             assert_eq!(events.len(), 1);
             let event = &events[0];
             assert!(event.timestamp_ns > 0);
-            let _all_fields = (
-                event.user_cpu_ns,
-                event.system_cpu_ns,
-                event.minor_faults,
-                event.major_faults,
-                event.block_input_ops,
-                event.block_output_ops,
-                event.voluntary_context_switches,
-                event.involuntary_context_switches,
-            );
             assert!(event.max_rss_bytes > 0);
         }
 
@@ -290,7 +287,7 @@ mod unix {
             source.flush(&ctx);
             buffer::drain_to_collector(&shared.collector);
 
-            let batch = shared.collector.next().expect("source emitted a batch");
+            let batch = shared.collector.next().expect("source should emit a batch");
             let events = decode_process_resource_usage_events(batch.encoded_bytes());
 
             assert_eq!(events.len(), 1);
