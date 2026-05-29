@@ -59,6 +59,7 @@ pub struct TracedRuntimeBuilder<P = NoTracePath, M = PipelineUnset> {
     pub(super) cpu_profiling_config: Option<crate::telemetry::cpu_profile::CpuProfilingConfig>,
     #[cfg(feature = "cpu-profiling")]
     pub(super) sched_event_config: Option<crate::telemetry::cpu_profile::SchedEventConfig>,
+    pub(super) system_metrics_config: Option<crate::telemetry::SystemMetricsConfig>,
     pub(super) pipeline: PipelineConfig,
     /// Static segment metadata to inject into every rotated segment's
     /// header. The S3 preset populates this from `S3Config::as_metadata`
@@ -168,6 +169,12 @@ impl<P, M> TracedRuntimeBuilder<P, M> {
         self
     }
 
+    /// Enable process-level system metrics sampled from `getrusage`.
+    pub fn with_system_metrics(mut self, config: crate::telemetry::SystemMetricsConfig) -> Self {
+        self.system_metrics_config = Some(config);
+        self
+    }
+
     /// Set how often the background worker polls for sealed segments.
     pub fn with_worker_poll_interval(mut self, interval: Duration) -> Self {
         self.worker_poll_interval = Some(interval);
@@ -242,6 +249,7 @@ impl<P, M> TracedRuntimeBuilder<P, M> {
             cpu_profiling_config: self.cpu_profiling_config,
             #[cfg(feature = "cpu-profiling")]
             sched_event_config: self.sched_event_config,
+            system_metrics_config: self.system_metrics_config,
             pipeline: self.pipeline,
             segment_metadata: self.segment_metadata,
             worker_poll_interval: self.worker_poll_interval,
@@ -463,6 +471,7 @@ impl<M> TracedRuntimeBuilder<HasTracePath, M> {
             .writer(writer)
             .maybe_trace_path(self.trace_path)
             .maybe_task_dump_config(self.task_dump_config)
+            .maybe_system_metrics(self.system_metrics_config)
             .maybe_worker_poll_interval(self.worker_poll_interval)
             .maybe_worker_metrics_sink(self.worker_metrics_sink)
             .processors(processors)
@@ -613,6 +622,8 @@ impl TelemetryCore {
         /// Enable scheduler event capture (Linux only).
         #[cfg(feature = "cpu-profiling")]
         sched_events: Option<crate::telemetry::cpu_profile::SchedEventConfig>,
+        /// Enable process-level system metrics sampled from `getrusage`.
+        system_metrics: Option<crate::telemetry::SystemMetricsConfig>,
         /// How often the background worker polls for sealed segments.
         worker_poll_interval: Option<Duration>,
         /// Metrics sink for the flush/worker threads.
@@ -667,6 +678,20 @@ impl TelemetryCore {
 
         if !segment_metadata.is_empty() {
             writer.update_segment_metadata(segment_metadata);
+        }
+
+        if let Some(config) = system_metrics {
+            #[cfg(unix)]
+            shared.push_source(Box::new(
+                crate::telemetry::system_metrics::SystemMetricsSource::new(config),
+            ));
+            #[cfg(not(unix))]
+            {
+                let _ = config;
+                tracing::warn!(
+                    "system metrics enabled but getrusage is not available on this platform"
+                );
+            }
         }
 
         #[cfg(feature = "cpu-profiling")]
@@ -833,6 +858,7 @@ impl TracedRuntime {
             cpu_profiling_config: None,
             #[cfg(feature = "cpu-profiling")]
             sched_event_config: None,
+            system_metrics_config: None,
             pipeline: PipelineConfig::Unset,
             segment_metadata: Vec::new(),
             worker_poll_interval: None,

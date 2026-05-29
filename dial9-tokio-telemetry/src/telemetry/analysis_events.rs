@@ -253,6 +253,32 @@ pub struct FreeEvent {
     pub alloc_timestamp_ns: u64,
 }
 
+/// Process-level system metrics sampled from `getrusage`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[non_exhaustive]
+pub struct SystemMetricsEvent {
+    /// Timestamp in nanoseconds (monotonic).
+    pub timestamp_ns: u64,
+    /// Cumulative user CPU time used by this process.
+    pub user_cpu_ns: u64,
+    /// Cumulative system CPU time used by this process.
+    pub system_cpu_ns: u64,
+    /// Maximum resident set size in bytes.
+    pub max_rss_bytes: u64,
+    /// Page faults serviced without disk I/O.
+    pub minor_faults: u64,
+    /// Page faults serviced with disk I/O.
+    pub major_faults: u64,
+    /// Block input operations performed by the process.
+    pub block_input_ops: u64,
+    /// Block output operations performed by the process.
+    pub block_output_ops: u64,
+    /// Voluntary context switches performed by the process.
+    pub voluntary_context_switches: u64,
+    /// Involuntary context switches performed by the process.
+    pub involuntary_context_switches: u64,
+}
+
 /// Tagged enum of all built-in event types for use as a serde decode target.
 ///
 /// Use with `#[serde(tag = "event")]` — the discriminant matches the wire
@@ -295,6 +321,8 @@ pub enum Dial9Event {
     AllocEvent(AllocEvent),
     /// A deallocation.
     FreeEvent(FreeEvent),
+    /// Process-level system metrics.
+    SystemMetricsEvent(SystemMetricsEvent),
     /// Unknown/custom event type.
     #[serde(other)]
     Other,
@@ -447,6 +475,21 @@ mod tests {
         })
         .unwrap();
 
+        // 15. SystemMetricsEvent
+        enc.write(&format::SystemMetricsEvent {
+            timestamp_ns: 14_000_000,
+            user_cpu_ns: 1_000_000,
+            system_cpu_ns: 2_000_000,
+            max_rss_bytes: 64 * 1024 * 1024,
+            minor_faults: 10,
+            major_faults: 1,
+            block_input_ops: 2,
+            block_output_ops: 3,
+            voluntary_context_switches: 4,
+            involuntary_context_switches: 5,
+        })
+        .unwrap();
+
         // ── Decode ──────────────────────────────────────────────────────────
         let bytes = enc.finish();
         let mut dec = Decoder::new(&bytes).expect("valid trace header");
@@ -456,7 +499,7 @@ mod tests {
         })
         .expect("decode");
 
-        assert_eq!(events.len(), 14);
+        assert_eq!(events.len(), 15);
 
         // 1. PollStartEvent
         let Dial9Event::PollStartEvent(ref e) = events[0] else {
@@ -583,6 +626,21 @@ mod tests {
         assert_eq!(e.addr, 0x7fff_0000_1000);
         assert_eq!(e.size, 1024);
         assert_eq!(e.alloc_timestamp_ns, 12_000_000);
+
+        // 15. SystemMetricsEvent
+        let Dial9Event::SystemMetricsEvent(ref e) = events[14] else {
+            panic!("expected SystemMetricsEvent, got {:?}", events[14]);
+        };
+        assert_eq!(e.timestamp_ns, 14_000_000);
+        assert_eq!(e.user_cpu_ns, 1_000_000);
+        assert_eq!(e.system_cpu_ns, 2_000_000);
+        assert_eq!(e.max_rss_bytes, 64 * 1024 * 1024);
+        assert_eq!(e.minor_faults, 10);
+        assert_eq!(e.major_faults, 1);
+        assert_eq!(e.block_input_ops, 2);
+        assert_eq!(e.block_output_ops, 3);
+        assert_eq!(e.voluntary_context_switches, 4);
+        assert_eq!(e.involuntary_context_switches, 5);
     }
 
     #[test]
