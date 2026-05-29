@@ -177,7 +177,7 @@ pub(crate) struct QueueSampleEvent {
 #[derive(Debug, TraceEvent)]
 #[cfg_attr(not(feature = "unstable-events"), non_exhaustive)]
 pub struct ProcessResourceUsageEvent {
-    /// Wall-clock timestamp in nanoseconds (monotonic).
+    /// Monotonic timestamp in nanoseconds.
     #[traceevent(timestamp)]
     pub timestamp_ns: u64,
     /// Cumulative user CPU time used by this process.
