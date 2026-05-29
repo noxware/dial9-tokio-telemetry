@@ -253,10 +253,10 @@ pub struct FreeEvent {
     pub alloc_timestamp_ns: u64,
 }
 
-/// Process-level system metrics sampled from `getrusage`.
+/// Process resource usage sampled from `getrusage(RUSAGE_SELF)`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[non_exhaustive]
-pub struct SystemMetricsEvent {
+pub struct ProcessResourceUsageEvent {
     /// Timestamp in nanoseconds (monotonic).
     pub timestamp_ns: u64,
     /// Cumulative user CPU time used by this process.
@@ -321,8 +321,8 @@ pub enum Dial9Event {
     AllocEvent(AllocEvent),
     /// A deallocation.
     FreeEvent(FreeEvent),
-    /// Process-level system metrics.
-    SystemMetricsEvent(SystemMetricsEvent),
+    /// Process resource usage.
+    ProcessResourceUsageEvent(ProcessResourceUsageEvent),
     /// Unknown/custom event type.
     #[serde(other)]
     Other,
@@ -475,8 +475,8 @@ mod tests {
         })
         .unwrap();
 
-        // 15. SystemMetricsEvent
-        enc.write(&format::SystemMetricsEvent {
+        // 15. ProcessResourceUsageEvent
+        enc.write(&format::ProcessResourceUsageEvent {
             timestamp_ns: 14_000_000,
             user_cpu_ns: 1_000_000,
             system_cpu_ns: 2_000_000,
@@ -627,9 +627,9 @@ mod tests {
         assert_eq!(e.size, 1024);
         assert_eq!(e.alloc_timestamp_ns, 12_000_000);
 
-        // 15. SystemMetricsEvent
-        let Dial9Event::SystemMetricsEvent(ref e) = events[14] else {
-            panic!("expected SystemMetricsEvent, got {:?}", events[14]);
+        // 15. ProcessResourceUsageEvent
+        let Dial9Event::ProcessResourceUsageEvent(ref e) = events[14] else {
+            panic!("expected ProcessResourceUsageEvent, got {:?}", events[14]);
         };
         assert_eq!(e.timestamp_ns, 14_000_000);
         assert_eq!(e.user_cpu_ns, 1_000_000);

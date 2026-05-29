@@ -1,41 +1,40 @@
-//! Process-level system metrics sampled from the operating system.
+//! Process resource usage sampled from the operating system.
 
 use std::time::Duration;
 
-/// Default interval for process system metrics samples.
-pub const DEFAULT_SYSTEM_METRICS_INTERVAL: Duration = Duration::from_secs(1);
+const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Configuration for process-level system metrics.
+/// Configuration for process resource usage sampling.
 ///
-/// Built via `SystemMetricsConfig::builder()...build()` and enabled with
-/// [`TracedRuntimeBuilder::with_system_metrics`](crate::telemetry::TracedRuntimeBuilder::with_system_metrics).
+/// Built via `ProcessResourceUsageConfig::builder()...build()` and enabled with
+/// [`TracedRuntimeBuilder::with_process_resource_usage`](crate::telemetry::TracedRuntimeBuilder::with_process_resource_usage).
 #[derive(Debug, Clone, bon::Builder)]
-pub struct SystemMetricsConfig {
+pub struct ProcessResourceUsageConfig {
     /// Minimum time between samples. Defaults to 1 second.
-    #[builder(default = DEFAULT_SYSTEM_METRICS_INTERVAL)]
-    interval: Duration,
+    #[builder(default = DEFAULT_SAMPLE_INTERVAL)]
+    sample_interval: Duration,
 }
 
-impl Default for SystemMetricsConfig {
+impl Default for ProcessResourceUsageConfig {
     fn default() -> Self {
         Self::builder().build()
     }
 }
 
-impl SystemMetricsConfig {
+impl ProcessResourceUsageConfig {
     /// Minimum time between samples.
-    pub fn interval(&self) -> Duration {
-        self.interval
+    pub fn sample_interval(&self) -> Duration {
+        self.sample_interval
     }
 }
 
 #[cfg(unix)]
 mod unix {
-    use super::SystemMetricsConfig;
+    use super::ProcessResourceUsageConfig;
     use crate::rate_limit::rate_limited;
     use crate::telemetry::buffer::record_encodable_event;
     use crate::telemetry::events::clock_monotonic_ns;
-    use crate::telemetry::format::SystemMetricsEvent;
+    use crate::telemetry::format::ProcessResourceUsageEvent;
     use crate::telemetry::recorder::source::{FlushContext, Source};
     use std::io;
     use std::mem::MaybeUninit;
@@ -48,13 +47,13 @@ mod unix {
 
     /// Flush-thread source that samples process `getrusage(RUSAGE_SELF)`.
     #[derive(Debug)]
-    pub(crate) struct SystemMetricsSource {
-        config: SystemMetricsConfig,
+    pub(crate) struct ProcessResourceUsageSource {
+        config: ProcessResourceUsageConfig,
         last_sample: Option<Instant>,
     }
 
     #[derive(Debug, Clone, Copy)]
-    struct SystemMetricsSnapshot {
+    struct ProcessResourceUsageSnapshot {
         user_cpu_ns: u64,
         system_cpu_ns: u64,
         max_rss_bytes: u64,
@@ -66,8 +65,8 @@ mod unix {
         involuntary_context_switches: u64,
     }
 
-    impl SystemMetricsSource {
-        pub(crate) fn new(config: SystemMetricsConfig) -> Self {
+    impl ProcessResourceUsageSource {
+        pub(crate) fn new(config: ProcessResourceUsageConfig) -> Self {
             Self {
                 config,
                 last_sample: None,
@@ -75,35 +74,35 @@ mod unix {
         }
     }
 
-    impl Source for SystemMetricsSource {
+    impl Source for ProcessResourceUsageSource {
         fn flush(&mut self, ctx: &FlushContext<'_>) {
             let now = Instant::now();
             if let Some(last_sample) = self.last_sample
-                && now.duration_since(last_sample) < self.config.interval
+                && now.duration_since(last_sample) < self.config.sample_interval
             {
                 return;
             }
             self.last_sample = Some(now);
 
-            match read_process_usage() {
+            match read_process_resource_usage() {
                 Ok(snapshot) => {
                     let event = snapshot.into_event(clock_monotonic_ns());
                     record_encodable_event(&event, ctx.collector, ctx.drain_epoch);
                 }
                 Err(e) => rate_limited!(Duration::from_secs(60), {
-                    tracing::warn!("failed to read system metrics via getrusage: {e}");
+                    tracing::warn!("failed to read process resource usage via getrusage: {e}");
                 }),
             }
         }
 
         fn name(&self) -> &'static str {
-            "system_metrics"
+            "process_resource_usage"
         }
     }
 
-    impl SystemMetricsSnapshot {
-        fn into_event(self, timestamp_ns: u64) -> SystemMetricsEvent {
-            SystemMetricsEvent {
+    impl ProcessResourceUsageSnapshot {
+        fn into_event(self, timestamp_ns: u64) -> ProcessResourceUsageEvent {
+            ProcessResourceUsageEvent {
                 timestamp_ns,
                 user_cpu_ns: self.user_cpu_ns,
                 system_cpu_ns: self.system_cpu_ns,
@@ -118,7 +117,7 @@ mod unix {
         }
     }
 
-    fn read_process_usage() -> io::Result<SystemMetricsSnapshot> {
+    fn read_process_resource_usage() -> io::Result<ProcessResourceUsageSnapshot> {
         snapshot_from_rusage(read_rusage()?)
     }
 
@@ -136,8 +135,8 @@ mod unix {
         Ok(unsafe { usage.assume_init() })
     }
 
-    fn snapshot_from_rusage(usage: libc::rusage) -> io::Result<SystemMetricsSnapshot> {
-        Ok(SystemMetricsSnapshot {
+    fn snapshot_from_rusage(usage: libc::rusage) -> io::Result<ProcessResourceUsageSnapshot> {
+        Ok(ProcessResourceUsageSnapshot {
             user_cpu_ns: timeval_to_ns(usage.ru_utime, "ru_utime")?,
             system_cpu_ns: timeval_to_ns(usage.ru_stime, "ru_stime")?,
             max_rss_bytes: max_rss_to_bytes(usage.ru_maxrss)?,
@@ -200,13 +199,13 @@ mod unix {
         #[derive(Debug, Deserialize)]
         #[serde(tag = "event")]
         enum DecodedEvent {
-            SystemMetricsEvent(DecodedSystemMetricsEvent),
+            ProcessResourceUsageEvent(DecodedProcessResourceUsageEvent),
             #[serde(other)]
             Other,
         }
 
         #[derive(Debug, Deserialize)]
-        struct DecodedSystemMetricsEvent {
+        struct DecodedProcessResourceUsageEvent {
             timestamp_ns: u64,
             user_cpu_ns: u64,
             system_cpu_ns: u64,
@@ -219,13 +218,15 @@ mod unix {
             involuntary_context_switches: u64,
         }
 
-        fn decode_system_metrics_events(bytes: &[u8]) -> Vec<DecodedSystemMetricsEvent> {
+        fn decode_process_resource_usage_events(
+            bytes: &[u8],
+        ) -> Vec<DecodedProcessResourceUsageEvent> {
             let mut decoder =
                 dial9_trace_format::decoder::Decoder::new(bytes).expect("valid trace header");
             let mut events = Vec::new();
             decoder
                 .for_each_event(|raw| match raw.deserialize().expect("deserialize event") {
-                    DecodedEvent::SystemMetricsEvent(event) => events.push(event),
+                    DecodedEvent::ProcessResourceUsageEvent(event) => events.push(event),
                     DecodedEvent::Other => {}
                 })
                 .expect("decode events");
@@ -233,13 +234,13 @@ mod unix {
         }
 
         #[test]
-        fn read_process_usage_returns_metrics() {
-            let snapshot = read_process_usage().expect("getrusage succeeds");
+        fn read_process_resource_usage_returns_metrics() {
+            let snapshot = read_process_resource_usage().expect("getrusage succeeds");
             assert!(snapshot.max_rss_bytes > 0);
         }
 
         #[test]
-        fn source_emits_system_metrics_event() {
+        fn source_emits_process_resource_usage_event() {
             let shared = SharedState::new(0, None);
             let thread_roles = HashMap::new();
             let ctx = FlushContext {
@@ -247,13 +248,13 @@ mod unix {
                 drain_epoch: &shared.drain_epoch,
                 thread_roles: &thread_roles,
             };
-            let mut source = SystemMetricsSource::new(SystemMetricsConfig::default());
+            let mut source = ProcessResourceUsageSource::new(ProcessResourceUsageConfig::default());
 
             source.flush(&ctx);
             buffer::drain_to_collector(&shared.collector);
 
             let batch = shared.collector.next().expect("source emitted a batch");
-            let events = decode_system_metrics_events(batch.encoded_bytes());
+            let events = decode_process_resource_usage_events(batch.encoded_bytes());
 
             assert_eq!(events.len(), 1);
             let event = &events[0];
@@ -272,7 +273,7 @@ mod unix {
         }
 
         #[test]
-        fn source_respects_interval() {
+        fn source_respects_sample_interval() {
             let shared = SharedState::new(0, None);
             let thread_roles = HashMap::new();
             let ctx = FlushContext {
@@ -280,17 +281,17 @@ mod unix {
                 drain_epoch: &shared.drain_epoch,
                 thread_roles: &thread_roles,
             };
-            let config = SystemMetricsConfig::builder()
-                .interval(Duration::from_secs(60))
+            let config = ProcessResourceUsageConfig::builder()
+                .sample_interval(Duration::from_secs(60))
                 .build();
-            let mut source = SystemMetricsSource::new(config);
+            let mut source = ProcessResourceUsageSource::new(config);
 
             source.flush(&ctx);
             source.flush(&ctx);
             buffer::drain_to_collector(&shared.collector);
 
             let batch = shared.collector.next().expect("source emitted a batch");
-            let events = decode_system_metrics_events(batch.encoded_bytes());
+            let events = decode_process_resource_usage_events(batch.encoded_bytes());
 
             assert_eq!(events.len(), 1);
         }
@@ -298,17 +299,17 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub(crate) use unix::SystemMetricsSource;
+pub(crate) use unix::ProcessResourceUsageSource;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn default_interval_is_one_second() {
+    fn default_sample_interval_is_one_second() {
         assert_eq!(
-            SystemMetricsConfig::default().interval(),
-            DEFAULT_SYSTEM_METRICS_INTERVAL
+            ProcessResourceUsageConfig::default().sample_interval(),
+            DEFAULT_SAMPLE_INTERVAL
         );
     }
 }

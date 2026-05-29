@@ -173,10 +173,10 @@ pub(crate) struct QueueSampleEvent {
     pub global_queue: u8,
 }
 
-/// Wire-format event for process-level system metrics sampled from `getrusage`.
+/// Wire-format event for process resource usage sampled from `getrusage(RUSAGE_SELF)`.
 #[derive(Debug, TraceEvent)]
 #[cfg_attr(not(feature = "unstable-events"), non_exhaustive)]
-pub struct SystemMetricsEvent {
+pub struct ProcessResourceUsageEvent {
     /// Wall-clock timestamp in nanoseconds (monotonic).
     #[traceevent(timestamp)]
     pub timestamp_ns: u64,
