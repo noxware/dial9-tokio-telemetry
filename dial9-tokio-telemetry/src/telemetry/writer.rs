@@ -1,19 +1,60 @@
 use dial9_trace_format::encoder::{Encoder, RawEncoder};
 
+use crate::background_task::fs::{ActiveHandle, Fs, RemoveReason};
+use crate::background_task::sealed::SegmentRef;
 use crate::rate_limit::rate_limited;
 use crate::telemetry::collector::Batch;
 use crate::telemetry::events::clock_pair;
 use crate::telemetry::format::{ClockSyncEvent, SegmentMetadataEvent};
-use std::collections::{BTreeMap, VecDeque};
-use std::fs::{self, File};
+use std::collections::VecDeque;
 use std::io::BufWriter;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use metrique_timesource::time_source;
 
+mod mode_sealed {
+    pub trait Sealed {}
+}
+
+/// Marker trait for `SegmentWriter`'s backend mode. Sealed: only [`Disk`]
+/// and [`Memory`] implement it.
+pub trait WriterMode: mode_sealed::Sealed + Send + 'static {
+    /// Whether the writer mode is disk-backed.
+    const IS_DISK: bool;
+}
+
+/// Disk-backed mode (default).
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct Disk;
+/// In-memory mode.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct Memory;
+
+impl mode_sealed::Sealed for Disk {}
+impl mode_sealed::Sealed for Memory {}
+impl WriterMode for Disk {
+    const IS_DISK: bool = true;
+}
+impl WriterMode for Memory {
+    const IS_DISK: bool = false;
+}
+
+/// Alias for the disk-backed writer (the default mode).
+pub type DiskWriter = SegmentWriter<Disk>;
+/// Alias for the in-memory writer.
+pub type InMemoryWriter = SegmentWriter<Memory>;
+
 /// Trait for writing encoded telemetry batches to a destination.
-pub trait TraceWriter: Send {
+///
+/// `Mode` ties the writer's storage backend (disk vs in-memory) to the
+/// builder's pipeline mode at the type level. Defaults to [`Disk`] so
+/// custom implementors of this trait need no changes for disk targets.
+pub trait TraceWriter<Mode: WriterMode = Disk>: Send {
     /// Flush buffered data to the underlying storage.
     fn flush(&mut self) -> std::io::Result<()>;
     /// Returns true if the writer rotated to a new file since the last call to this method.
@@ -42,7 +83,7 @@ pub trait TraceWriter: Send {
         Ok(())
     }
     /// Returns `true` when the flush loop should drain all thread-local
-    /// buffers before the next step. For `RotatingWriter` this fires when the
+    /// buffers before the next step. For `SegmentWriter` this fires when the
     /// rotation period has elapsed since the last rotation *or* when a periodic
     /// drain interval elapses (whichever comes first). Default returns `false`.
     fn should_drain(&self) -> bool {
@@ -54,9 +95,16 @@ pub trait TraceWriter: Send {
     fn drained(&mut self) -> std::io::Result<bool> {
         Ok(false)
     }
+    /// Return the `Arc<Fs>` backing this writer, if any, so the recorder
+    /// builder can share it with the worker. Default `None`.
+    #[doc(hidden)]
+    #[allow(private_interfaces)]
+    fn fs_handle(&self) -> Option<Arc<Fs>> {
+        None
+    }
 }
 
-impl<W: TraceWriter + ?Sized> TraceWriter for Box<W> {
+impl<Mode: WriterMode, W: TraceWriter<Mode> + ?Sized> TraceWriter<Mode> for Box<W> {
     fn flush(&mut self) -> std::io::Result<()> {
         (**self).flush()
     }
@@ -83,6 +131,10 @@ impl<W: TraceWriter + ?Sized> TraceWriter for Box<W> {
     }
     fn drained(&mut self) -> std::io::Result<bool> {
         (**self).drained()
+    }
+    #[allow(private_interfaces)]
+    fn fs_handle(&self) -> Option<Arc<Fs>> {
+        (**self).fs_handle()
     }
 }
 
@@ -171,21 +223,11 @@ fn derive_max_file_size(max_total_size: u64) -> u64 {
     (max_total_size / 4).min(MAX_FILE_SIZE_CAP)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SegmentArtifact {
-    Retained { index: u32 },
-    Active,
-}
-
-struct ExistingSegments {
-    closed_files: VecDeque<(PathBuf, u64)>,
-    next_active_index: u32,
-}
-
-/// A writer that rotates trace files to bound disk usage and time.
+/// A writer that rotates trace segments to bound resource usage and time.
+/// Generic over backend: use [`DiskWriter`] (files) or [`InMemoryWriter`].
 ///
 /// Rotation triggers when *either* condition is met:
-/// - `max_file_size`: the current file exceeds this many bytes
+/// - `max_file_size`: the active segment exceeds this many bytes
 /// - `rotation_period`: this much monotonic time has elapsed since the writer
 ///   (or the previous rotation) started (default: 1 minute)
 ///
@@ -197,16 +239,15 @@ struct ExistingSegments {
 /// in time. Set `max_file_size` large enough that time-based rotation fires
 /// first under normal conditions (e.g. 100 MB or more). Size-based rotation
 /// then acts as a safety valve for unexpected data bursts. When using
-/// [`RotatingWriter::builder`] without specifying `max_file_size`, it
-/// defaults to `min(100 MiB, max_total_size / 4)`.
+/// [`DiskWriter::builder`] without specifying `max_file_size`, it
+/// defaults to `min(100 MiB, max_total_size / 4)` on disk.
 ///
-/// `max_total_size` controls eviction: oldest retained files for this trace
-/// family are deleted when total size exceeds this budget, including artifacts
-/// left by previous writer lifetimes.
+/// `max_total_size` is the retention budget across closed segments. The
+/// oldest segments are dropped once the total exceeds this budget.
 ///
-/// Files are named `{base_path}.0.bin`, `{base_path}.1.bin`, etc.
-/// Each file is a self-contained trace with its own header.
-pub struct RotatingWriter {
+/// Disk segments are named `{base_path}.0.bin`, `{base_path}.1.bin`, etc.,
+/// each a self-contained trace with its own header.
+pub struct SegmentWriter<Mode: WriterMode = Disk> {
     base_path: PathBuf,
     max_file_size: u64,
     max_total_size: u64,
@@ -216,10 +257,11 @@ pub struct RotatingWriter {
     /// The next monotonic instant at which time-based rotation should fire,
     /// or `None` if time-based rotation is disabled.
     next_rotation_time: Option<Instant>,
-    /// Tracks (path, size) of closed files oldest-first. The active file is
-    /// not in this list — its size comes from `encoder.bytes_written()`.
-    closed_files: VecDeque<(PathBuf, u64)>,
-    /// Path of the currently active (being-written) file.
+    /// Tracks (seg_ref, size) of closed segments oldest-first for disk eviction.
+    /// Always empty in memory mode (eviction handled by the memory backend).
+    closed_files: VecDeque<(SegmentRef, u64)>,
+    /// Path of the currently active (being-written) segment.
+    /// Used as a HashMap key in memory mode; a real path in disk mode.
     active_path: PathBuf,
     state: WriterState,
     next_index: u32,
@@ -238,11 +280,14 @@ pub struct RotatingWriter {
     drain_interval: Duration,
     /// Next monotonic instant at which `should_drain()` returns true.
     next_drain_time: Instant,
+    /// Unified filesystem/channel abstraction.
+    fs: Arc<Fs>,
+    _mode: PhantomData<Mode>,
 }
 
-impl std::fmt::Debug for RotatingWriter {
+impl<M: WriterMode> std::fmt::Debug for SegmentWriter<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RotatingWriter")
+        f.debug_struct("SegmentWriter")
             .field("base_path", &self.base_path)
             .field("max_file_size", &self.max_file_size)
             .field("max_total_size", &self.max_total_size)
@@ -250,13 +295,13 @@ impl std::fmt::Debug for RotatingWriter {
     }
 }
 
-// the write side is obviously marge larger than the `Finished` size so clippy warns on this
+// the write side is obviously larger than the `Finished` size so clippy warns on this
 // but we don't want to force going through a pointer every time we want to write.
 #[allow(clippy::large_enum_variant)]
 enum WriterState {
     /// Writer is open and events can be written
     Active {
-        writer: RawEncoder<BufWriter<File>>,
+        writer: RawEncoder<BufWriter<ActiveHandle>>,
         need_metadata: bool,
     },
 
@@ -265,9 +310,9 @@ enum WriterState {
 }
 
 #[bon::bon]
-impl RotatingWriter {
+impl SegmentWriter<Disk> {
     /// Create a new rotating writer. For additional options like `segment_metadata`,
-    /// use [`RotatingWriter::builder()`].
+    /// use [`DiskWriter::builder()`].
     pub fn new(
         base_path: impl Into<PathBuf>,
         max_file_size: u64,
@@ -282,11 +327,11 @@ impl RotatingWriter {
         )
     }
 
-    /// Create a `RotatingWriterBuilder` for advanced configuration.
+    /// Create a `DiskWriterBuilder` for advanced configuration.
     ///
     /// When `max_file_size` is omitted, it defaults to
     /// `min(100 MiB, max_total_size / 4)`.
-    #[builder(builder_type = RotatingWriterBuilder, finish_fn = build)]
+    #[builder(builder_type = DiskWriterBuilder, finish_fn = build)]
     pub fn builder(
         base_path: impl Into<PathBuf>,
         /// Per-file rotation threshold in bytes. Defaults to
@@ -321,20 +366,22 @@ impl RotatingWriter {
             return Err(std::io::Error::other("Rotation period must not be zero"));
         }
         let base_path = base_path.into();
-        if let Some(parent) = base_path.parent() {
-            fs::create_dir_all(parent)?;
+        if let Some(parent) = base_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
-        let existing_segments = Self::discover_existing_segments(&base_path)?;
-        let first_path = Self::active_path(&base_path, existing_segments.next_active_index);
-        let file = File::create(&first_path)?;
-        let writer = BufWriter::new(file);
-        let state = Self::prepare_segment(writer)?;
-        let now = time_source().instant().as_std();
-        let drain_interval = rotation_period.min(DEFAULT_DRAIN_INTERVAL);
-        let next_index = existing_segments
-            .next_active_index
+        let fs = Fs::new_disk(&base_path);
+        let discovered = fs.discover_existing()?;
+        let first_index = discovered.next_active_index;
+        let next_index = first_index
             .checked_add(1)
             .ok_or_else(|| std::io::Error::other("trace segment index overflow"))?;
+        let first_path = Self::active_path(&base_path, first_index);
+        let handle = fs.create_segment(&first_path)?;
+        let state = Self::prepare_segment(BufWriter::new(handle))?;
+        let now = time_source().instant().as_std();
+        let drain_interval = rotation_period.min(DEFAULT_DRAIN_INTERVAL);
 
         let mut writer = Self {
             base_path,
@@ -342,7 +389,7 @@ impl RotatingWriter {
             max_total_size,
             rotation_period,
             next_rotation_time: Self::next_rotation_from(now, rotation_period),
-            closed_files: existing_segments.closed_files,
+            closed_files: discovered.closed_files,
             active_path: first_path,
             state,
             next_index,
@@ -352,7 +399,11 @@ impl RotatingWriter {
             has_real_events: false,
             drain_interval,
             next_drain_time: now + drain_interval,
+            fs,
+            _mode: PhantomData,
         };
+        // Enforce the budget immediately so artifacts from prior writer
+        // lifetimes don't push us over the cap before we even rotate once.
         writer.evict_oldest()?;
         Ok(writer)
     }
@@ -366,13 +417,10 @@ impl RotatingWriter {
     /// Time-based rotation is disabled.
     pub fn single_file(path: impl Into<PathBuf>) -> std::io::Result<Self> {
         let path = path.into();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let fs = Fs::new_disk(&path);
         let active_path = Self::active_path(&path, 0);
-        let file = File::create(&active_path)?;
-        let writer = BufWriter::new(file);
-        let state = Self::prepare_segment(writer)?;
+        let handle = fs.create_segment(&active_path)?;
+        let state = Self::prepare_segment(BufWriter::new(handle))?;
         let now = time_source().instant().as_std();
 
         Ok(Self {
@@ -391,9 +439,126 @@ impl RotatingWriter {
             has_real_events: false,
             drain_interval: DEFAULT_DRAIN_INTERVAL,
             next_drain_time: now + DEFAULT_DRAIN_INTERVAL,
+            fs,
+            _mode: PhantomData,
         })
     }
+}
 
+/// Default segment size when no explicit segment size is provided.
+/// Always at least 8 slots of burst headroom in the ring.
+fn pick_segment_size(max_total_size: u64) -> u64 {
+    const MIN_SLOTS: u64 = 8;
+    (max_total_size / MIN_SLOTS).max(1)
+}
+
+#[bon::bon]
+impl SegmentWriter<Memory> {
+    /// Create an in-memory writer with a total byte budget. Segments live in process heap
+    /// instead of files. Auto-picks a reasonable segment size,
+    /// use [`builder`](Self::builder) for explicit control.
+    ///
+    /// Same rotation semantics as the disk path. Errors when
+    /// `max_total_size == 0`.
+    pub fn new(max_total_size: u64) -> std::io::Result<Self> {
+        Self::create_in_memory(
+            max_total_size,
+            pick_segment_size(max_total_size),
+            DEFAULT_ROTATION_PERIOD,
+            SegmentMetadata::default(),
+        )
+    }
+
+    /// Builder for in-memory writer configuration.
+    #[builder(builder_type = InMemoryWriterBuilder, finish_fn = build)]
+    pub fn builder(
+        max_total_size: u64,
+        /// Override the default segment size.
+        max_segment_size: Option<u64>,
+        /// Wall-clock rotation period.
+        rotation_period: Option<Duration>,
+        segment_metadata: Option<Vec<(String, String)>>,
+    ) -> std::io::Result<Self> {
+        let seg_size = max_segment_size.unwrap_or_else(|| pick_segment_size(max_total_size));
+        Self::create_in_memory(
+            max_total_size,
+            seg_size,
+            rotation_period.unwrap_or(DEFAULT_ROTATION_PERIOD),
+            segment_metadata
+                .map(SegmentMetadata::new)
+                .unwrap_or_default(),
+        )
+    }
+
+    fn create_in_memory(
+        max_total_size: u64,
+        max_segment_size: u64,
+        rotation_period: Duration,
+        segment_metadata: SegmentMetadata,
+    ) -> std::io::Result<Self> {
+        if max_total_size == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "max_total_size must be > 0",
+            ));
+        }
+        if max_segment_size == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "max_segment_size must be > 0",
+            ));
+        }
+        if rotation_period == Duration::from_secs(0) {
+            return Err(std::io::Error::other("Rotation period must not be zero"));
+        }
+        // The active buffer and the worker's in-flight segment live outside the ring, so the ring needs
+        // room for at least one sealed segment on top of that reserve.
+        let min_total = (crate::background_task::fs::PIPELINE_RESERVE_SEGMENTS + 1)
+            .saturating_mul(max_segment_size);
+        if max_total_size < min_total {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "max_total_size ({max_total_size}) must be >= {min_total} \
+                     ({} × max_segment_size: 1 active + 1 in-flight + 1 ring slot)",
+                    crate::background_task::fs::PIPELINE_RESERVE_SEGMENTS + 1
+                ),
+            ));
+        }
+        let fs = Fs::new_in_memory(max_total_size, max_segment_size)?;
+        // Dummy prefix, the memory backend ignores paths but `active_path`
+        // still needs one.
+        let base_path = PathBuf::from("mem");
+        let active_path = Self::active_path(&base_path, 0);
+        let handle = fs.create_segment(&active_path)?;
+        let state = Self::prepare_segment(BufWriter::new(handle))?;
+        let now = time_source().instant().as_std();
+        // Drain at least as often as we rotate.
+        let drain_interval = rotation_period.min(DEFAULT_DRAIN_INTERVAL);
+
+        Ok(Self {
+            base_path,
+            max_file_size: max_segment_size,
+            max_total_size,
+            rotation_period,
+            next_rotation_time: Self::next_rotation_from(now, rotation_period),
+            closed_files: VecDeque::new(),
+            active_path,
+            state,
+            next_index: 1,
+            did_rotate: false,
+            segment_metadata,
+            dropped_events: 0,
+            has_real_events: false,
+            drain_interval,
+            next_drain_time: now + drain_interval,
+            fs,
+            _mode: PhantomData,
+        })
+    }
+}
+
+impl<M: WriterMode> SegmentWriter<M> {
     /// The base path used for trace segment files.
     pub fn base_path(&self) -> &Path {
         &self.base_path
@@ -407,7 +572,7 @@ impl RotatingWriter {
     /// Create an encoder, write the file header, segment metadata, and a
     /// clock-sync anchor, then convert to a [`RawEncoder`] for the
     /// remainder of the file's lifetime.
-    fn prepare_segment(writer: BufWriter<File>) -> std::io::Result<WriterState> {
+    fn prepare_segment(writer: BufWriter<ActiveHandle>) -> std::io::Result<WriterState> {
         let mut encoder = Encoder::new_to(writer)?;
         let (mono, real) = clock_pair();
         encoder.write(&ClockSyncEvent {
@@ -439,7 +604,7 @@ impl RotatingWriter {
     /// Write a `SegmentMetadataEvent` and a fresh `ClockSyncEvent` into
     /// the current active segment.
     fn write_segment_metadata(
-        writer: &mut RawEncoder<BufWriter<File>>,
+        writer: &mut RawEncoder<BufWriter<ActiveHandle>>,
         entries: &[(String, String)],
     ) -> std::io::Result<()> {
         let mut enc = Encoder::new();
@@ -457,104 +622,11 @@ impl RotatingWriter {
         Ok(())
     }
 
-    fn file_path(base: &Path, index: u32) -> PathBuf {
-        let stem = base.file_stem().unwrap_or_default().to_string_lossy();
-        let parent = base.parent().unwrap_or(Path::new("."));
-        parent.join(format!("{}.{}.bin", stem, index))
-    }
-
     /// Path for a segment that is actively being written.
     fn active_path(base: &Path, index: u32) -> PathBuf {
         let stem = base.file_stem().unwrap_or_default().to_string_lossy();
         let parent = base.parent().unwrap_or(Path::new("."));
         parent.join(format!("{}.{}.bin.active", stem, index))
-    }
-
-    /// Discover retained segment artifacts from previous writer lifetimes.
-    ///
-    /// `closed_files` keeps one canonical path per segment index, but its size
-    /// accounts for every retained on-disk artifact for that index (`.bin`,
-    /// `.bin.gz`, or future write-back variants). Stale `.active` files belong
-    /// to dead writers and are not consumable by the worker, so discard them
-    /// before creating the new active segment.
-    fn discover_existing_segments(base: &Path) -> std::io::Result<ExistingSegments> {
-        let stem = base.file_stem().unwrap_or_default().to_string_lossy();
-        let parent = base.parent().unwrap_or(Path::new("."));
-        let mut retained_sizes = BTreeMap::<u32, u64>::new();
-
-        if parent.exists() {
-            for entry in fs::read_dir(parent)? {
-                let entry = entry?;
-                let path = entry.path();
-                let metadata = match entry.metadata() {
-                    Ok(metadata) => metadata,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(e),
-                };
-                if !metadata.is_file() {
-                    continue;
-                }
-                let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-                    continue;
-                };
-
-                match Self::parse_segment_artifact(file_name, &stem) {
-                    Some(SegmentArtifact::Retained { index }) => {
-                        *retained_sizes.entry(index).or_default() += metadata.len();
-                    }
-                    Some(SegmentArtifact::Active) => {
-                        tracing::warn!(
-                            path = %path.display(),
-                            "discarding stale active trace segment from a previous writer"
-                        );
-                        match fs::remove_file(path) {
-                            Ok(()) => {}
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    None => {}
-                }
-            }
-        }
-
-        let next_active_index = retained_sizes
-            .last_key_value()
-            .map(|(&index, _)| {
-                index
-                    .checked_add(1)
-                    .ok_or_else(|| std::io::Error::other("trace segment index overflow"))
-            })
-            .transpose()?
-            .unwrap_or(0);
-        let closed_files = retained_sizes
-            .into_iter()
-            .map(|(index, size)| (Self::file_path(base, index), size))
-            .collect();
-
-        Ok(ExistingSegments {
-            closed_files,
-            next_active_index,
-        })
-    }
-
-    fn parse_segment_artifact(file_name: &str, stem: &str) -> Option<SegmentArtifact> {
-        let rest = file_name.strip_prefix(stem)?.strip_prefix('.')?;
-        if rest
-            .strip_suffix(".bin.active")
-            .and_then(|index| index.parse::<u32>().ok())
-            .is_some()
-        {
-            return Some(SegmentArtifact::Active);
-        }
-
-        let (index, suffix) = rest.split_once(".bin")?;
-        if !suffix.is_empty() && !suffix.starts_with('.') {
-            return None;
-        }
-        Some(SegmentArtifact::Retained {
-            index: index.parse().ok()?,
-        })
     }
 
     /// Compute the next rotation deadline as `now + period`, or `None` when
@@ -564,9 +636,9 @@ impl RotatingWriter {
     }
 
     fn rotate(&mut self) -> std::io::Result<()> {
-        let WriterState::Active { writer: raw, .. } = &mut self.state else {
+        if matches!(self.state, WriterState::Finished) {
             return Ok(());
-        };
+        }
 
         // Advance timers up front. If anything below fails the flush loop must
         // NOT see should_drain() return true on the next 5ms tick — otherwise
@@ -575,19 +647,35 @@ impl RotatingWriter {
         self.next_rotation_time = Self::next_rotation_from(now, self.rotation_period);
         self.next_drain_time = now + self.drain_interval;
 
+        // Take ownership of the encoder (state is Finished until new segment opens).
+        let WriterState::Active {
+            writer: mut raw, ..
+        } = std::mem::replace(&mut self.state, WriterState::Finished)
+        else {
+            return Ok(());
+        };
+
         // Best-effort flush. If the underlying file is gone the buffered bytes
         // are already lost; proceed to rotate rather than erroring.
         let _ = raw.flush();
         let closed_size = raw.bytes_written();
-        let sealed_path = Self::file_path(&self.base_path, self.next_index - 1);
+        let current_index = self.next_index - 1;
+
+        // Extract the ActiveHandle for sealing.
+        let bw: BufWriter<ActiveHandle> = raw.into_inner();
+        let handle: ActiveHandle = bw
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner().into_parts().0);
 
         // Seal the current segment. If `.active` was removed externally
-        // (operator, log rotation, container teardown) abandon the segment
-        // and start a fresh one. On any other error give up cleanly: mark
-        // the writer Finished so writes and rotations stop, instead of
-        // leaving inconsistent state.
-        match fs::rename(&self.active_path, &sealed_path) {
-            Ok(()) => self.closed_files.push_back((sealed_path, closed_size)),
+        // (disk only: operator, log rotation, container teardown) abandon the
+        // segment and start a fresh one.
+        match self.fs.seal(handle, &self.active_path, current_index) {
+            Ok(seg_ref) => {
+                if M::IS_DISK {
+                    self.closed_files.push_back((seg_ref, closed_size));
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 rate_limited!(Duration::from_secs(60), {
                     tracing::warn!(
@@ -598,7 +686,7 @@ impl RotatingWriter {
                 });
             }
             Err(e) => {
-                self.state = WriterState::Finished;
+                // state is already Finished from mem::replace above
                 return Err(e);
             }
         }
@@ -606,39 +694,16 @@ impl RotatingWriter {
         let new_path = Self::active_path(&self.base_path, self.next_index);
         self.next_index += 1;
 
-        // Open the new active file. NotFound here typically means the parent
-        // directory itself was removed (the most likely real-world cause of
-        // the original `.active` file disappearing too). Try to recreate the
-        // directory once and retry. If that still fails, mark Finished so the
-        // writer stops cleanly rather than retrying every drain cycle.
-        let file = match File::create(&new_path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if let Some(parent) = new_path.parent()
-                    && let Err(mkdir_err) = fs::create_dir_all(parent)
-                {
-                    self.state = WriterState::Finished;
-                    return Err(mkdir_err);
-                }
-                match File::create(&new_path) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        self.state = WriterState::Finished;
-                        return Err(e);
-                    }
-                }
-            }
-            Err(e) => {
-                self.state = WriterState::Finished;
-                return Err(e);
-            }
-        };
-        let writer = BufWriter::new(file);
-        self.state = match Self::prepare_segment(writer) {
+        // Open the new active segment. The backend self-heals if a disk
+        // parent directory was removed underneath us, any other failure
+        // leaves state = Finished so the writer stops cleanly rather than
+        // retrying every drain cycle.
+        let handle: ActiveHandle = self.fs.create_segment(&new_path)?;
+
+        self.state = match Self::prepare_segment(BufWriter::new(handle)) {
             Ok(s) => s,
             Err(e) => {
-                let _ = std::fs::remove_file(&new_path);
-                self.state = WriterState::Finished;
+                let _ = self.fs.remove_active(&new_path);
                 return Err(e);
             }
         };
@@ -654,8 +719,12 @@ impl RotatingWriter {
         Ok(())
     }
 
-    /// Total size across all files (closed + active).
+    /// Total size across all closed + active segments (disk mode only).
+    /// Always returns 0 in memory mode, eviction is handled by the memory backend.
     fn total_size(&self) -> u64 {
+        if !M::IS_DISK {
+            return 0;
+        }
         let closed: u64 = self.closed_files.iter().map(|(_, s)| s).sum();
         let active = match &self.state {
             WriterState::Active { writer, .. } => writer.bytes_written(),
@@ -665,14 +734,13 @@ impl RotatingWriter {
     }
 
     fn evict_oldest(&mut self) -> std::io::Result<()> {
+        if !M::IS_DISK {
+            return Ok(());
+        }
         // Always keep at least the current file.
         while self.total_size() > self.max_total_size && !self.closed_files.is_empty() {
-            if let Some((path, _size)) = self.closed_files.pop_front()
-                && let Err(e) = Self::remove_segment_artifacts(&path)
-            {
-                rate_limited!(Duration::from_secs(60), {
-                    tracing::warn!("failed to evict old trace segment {}: {e}", path.display());
-                });
+            if let Some((seg_ref, _size)) = self.closed_files.pop_front() {
+                self.fs.remove_sealed(&seg_ref, RemoveReason::Eviction);
             }
         }
         // If even the current file alone exceeds total budget, stop writing.
@@ -680,41 +748,6 @@ impl RotatingWriter {
             self.state = WriterState::Finished;
         }
         Ok(())
-    }
-
-    fn remove_segment_artifacts(path: &Path) -> std::io::Result<()> {
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            return Ok(());
-        };
-        let Some(parent) = path.parent() else {
-            return Ok(());
-        };
-
-        match fs::read_dir(parent) {
-            Ok(entries) => {
-                for entry in entries {
-                    let entry = entry?;
-                    let artifact_name = entry.file_name();
-                    let Some(artifact_name) = artifact_name.to_str() else {
-                        continue;
-                    };
-                    if artifact_name == file_name
-                        || artifact_name
-                            .strip_prefix(file_name)
-                            .is_some_and(|suffix| suffix.starts_with('.'))
-                    {
-                        match fs::remove_file(entry.path()) {
-                            Ok(()) => {}
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(e) => return Err(e),
-                        }
-                    }
-                }
-                Ok(())
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
     }
 
     /// Rotate if the current file exceeds max_file_size.
@@ -730,7 +763,12 @@ impl RotatingWriter {
     }
 }
 
-impl TraceWriter for RotatingWriter {
+impl<M: WriterMode> TraceWriter<M> for SegmentWriter<M> {
+    #[allow(private_interfaces)]
+    fn fs_handle(&self) -> Option<Arc<Fs>> {
+        Some(Arc::clone(&self.fs))
+    }
+
     fn flush(&mut self) -> std::io::Result<()> {
         if let WriterState::Active { writer: raw, .. } = &mut self.state {
             raw.flush()?;
@@ -775,7 +813,7 @@ impl TraceWriter for RotatingWriter {
             self.rotate()?;
             return Ok(true);
         }
-        // Periodic drain without rotation — just advance the drain timer.
+        // Periodic drain without rotation; advance the drain timer.
         self.next_drain_time = now + self.drain_interval;
         Ok(false)
     }
@@ -785,51 +823,72 @@ impl TraceWriter for RotatingWriter {
             rate_limited!(Duration::from_secs(60), {
                 tracing::warn!("writer is already closed.");
             });
+            self.fs.mark_writer_done();
+            return Ok(());
         }
         // Best-effort flush: if the file is gone the bytes are already lost.
         let _ = self.flush();
-        if self
-            .active_path
-            .extension()
-            .is_some_and(|ext| ext == "active")
-        {
-            if self.has_real_events {
-                let sealed = Self::file_path(&self.base_path, self.next_index - 1);
-                match fs::rename(&self.active_path, &sealed) {
-                    Ok(()) => self.active_path = sealed,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        rate_limited!(Duration::from_secs(60), {
-                            tracing::warn!(
-                                "active trace file {} disappeared before finalize; \
-                                 dropping segment",
-                                self.active_path.display()
-                            );
-                        });
-                    }
-                    Err(e) => {
-                        self.state = WriterState::Finished;
-                        return Err(e);
+
+        // Take ownership of the encoder (state -> Finished).
+        let WriterState::Active { writer: raw, .. } =
+            std::mem::replace(&mut self.state, WriterState::Finished)
+        else {
+            self.fs.mark_writer_done();
+            return Ok(());
+        };
+
+        let bytes_written = raw.bytes_written();
+        let bw: BufWriter<ActiveHandle> = raw.into_inner();
+        let handle: ActiveHandle = bw
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner().into_parts().0);
+
+        let current_index = self.next_index - 1;
+
+        if self.has_real_events {
+            match self.fs.seal(handle, &self.active_path, current_index) {
+                Ok(seg_ref) => {
+                    if M::IS_DISK {
+                        self.closed_files.push_back((seg_ref, bytes_written));
                     }
                 }
-            } else {
-                // No real events — just header + metadata. Remove instead of
-                // sealing so the background worker doesn't upload an empty segment.
-                tracing::debug!(
-                    "removing empty final segment {}",
-                    self.active_path.display()
-                );
-                if let Err(e) = fs::remove_file(&self.active_path)
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    self.state = WriterState::Finished;
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    rate_limited!(Duration::from_secs(60), {
+                        tracing::warn!(
+                            "active trace file {} disappeared before finalize; \
+                             dropping segment",
+                            self.active_path.display()
+                        );
+                    });
+                }
+                Err(e) => {
+                    self.fs.mark_writer_done();
                     return Err(e);
                 }
             }
+        } else {
+            // No real events — just header + metadata. Remove instead of
+            // sealing so the background worker doesn't upload an empty segment.
+            tracing::debug!(
+                "removing empty final segment {}",
+                self.active_path.display()
+            );
+            if let Err(e) = self.fs.remove_active(&self.active_path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                self.fs.mark_writer_done();
+                return Err(e);
+            }
         }
-        if self.has_real_events {
-            self.evict_oldest()?;
+
+        // Final sealed segment must count toward the eviction budget too,
+        // otherwise finalize can leave the directory over `max_total_size`.
+        // No-ops on memory mode (`!M::IS_DISK`).
+        if let Err(e) = self.evict_oldest() {
+            self.fs.mark_writer_done();
+            return Err(e);
         }
-        self.state = WriterState::Finished;
+        self.fs.mark_writer_done();
         Ok(())
     }
 
@@ -858,14 +917,14 @@ impl TraceWriter for RotatingWriter {
     }
 }
 
-impl Drop for RotatingWriter {
+impl<M: WriterMode> Drop for SegmentWriter<M> {
     fn drop(&mut self) {
         if self.dropped_events > 0 {
             rate_limited!(Duration::from_secs(60), {
                 tracing::info!(
                     target: "dial9_telemetry",
                     dropped_events = self.dropped_events,
-                    "RotatingWriter dropped events after finalization"
+                    "SegmentWriter dropped events after finalization"
                 );
             });
         }
@@ -916,18 +975,15 @@ mod tests {
             .collect()
     }
 
-    /// Total size of all trace files in a directory, including write-back
-    /// artifacts such as `.bin.gz`.
+    /// Total size of all trace files (.bin and .active) in a directory.
     fn total_disk_usage(dir: &std::path::Path) -> u64 {
         std::fs::read_dir(dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| {
-                e.file_name().to_str().is_some_and(|name| {
-                    name.ends_with(".bin")
-                        || name.ends_with(".bin.active")
-                        || name.contains(".bin.")
-                })
+                let p = e.path();
+                p.extension()
+                    .is_some_and(|ext| ext == "bin" || ext == "active")
             })
             .map(|e| e.metadata().unwrap().len())
             .sum()
@@ -939,7 +995,7 @@ mod tests {
     fn single_event_file_size() -> u64 {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("probe.bin");
-        let mut w = RotatingWriter::single_file(&path).unwrap();
+        let mut w = DiskWriter::single_file(&path).unwrap();
         w.write_encoded_batch(&test_batch()).unwrap();
         w.flush().unwrap();
         std::fs::metadata(w.current_active_path()).unwrap().len()
@@ -949,7 +1005,7 @@ mod tests {
     fn test_writer_creation() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test_trace_v2.bin");
-        let writer = RotatingWriter::single_file(&path);
+        let writer = DiskWriter::single_file(&path);
         assert!(writer.is_ok());
     }
 
@@ -971,7 +1027,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("default_size.bin");
         let total = 64 * BYTES_PER_MIB;
-        let writer = RotatingWriter::builder()
+        let writer = DiskWriter::builder()
             .base_path(&path)
             .max_total_size(total)
             .build()
@@ -983,7 +1039,7 @@ mod tests {
     fn builder_honors_explicit_max_file_size() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("explicit_size.bin");
-        let writer = RotatingWriter::builder()
+        let writer = DiskWriter::builder()
             .base_path(&path)
             .max_file_size(7 * BYTES_PER_MIB)
             .max_total_size(64 * BYTES_PER_MIB)
@@ -996,7 +1052,7 @@ mod tests {
     fn test_write_event() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test_event_v2.bin");
-        let mut writer = RotatingWriter::single_file(&path).unwrap();
+        let mut writer = DiskWriter::single_file(&path).unwrap();
 
         writer.write_encoded_batch(&test_batch()).unwrap();
         writer.flush().unwrap();
@@ -1012,7 +1068,7 @@ mod tests {
     fn test_write_batch_sizes() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test_batch_v2.bin");
-        let mut writer = RotatingWriter::single_file(&path).unwrap();
+        let mut writer = DiskWriter::single_file(&path).unwrap();
 
         let one_event_size = single_event_file_size();
 
@@ -1030,7 +1086,7 @@ mod tests {
     fn test_binary_format_header() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test_format_v2.bin");
-        let writer = RotatingWriter::single_file(&path).unwrap();
+        let writer = DiskWriter::single_file(&path).unwrap();
         let active = writer.current_active_path().to_owned();
         drop(writer);
 
@@ -1044,7 +1100,7 @@ mod tests {
     fn test_rotating_writer_creation() {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
-        let mut writer = RotatingWriter::new(&base, 1024, 4096).unwrap();
+        let mut writer = DiskWriter::new(&base, 1024, 4096).unwrap();
         writer.finalize().unwrap();
 
         // No real events were written, so finalize removes the empty segment.
@@ -1064,7 +1120,7 @@ mod tests {
         let base = dir.path().join("trace");
         // Set max_file_size to fit ~1 event so rotation triggers quickly
         let one_event = single_event_file_size();
-        let mut writer = RotatingWriter::new(&base, one_event, 100_000).unwrap();
+        let mut writer = DiskWriter::new(&base, one_event, 100_000).unwrap();
 
         for _ in 0..3 {
             writer.write_encoded_batch(&test_batch()).unwrap();
@@ -1092,7 +1148,7 @@ mod tests {
         let one_event = single_event_file_size();
         let max_file_size = one_event;
         let max_total_size = max_file_size * 3;
-        let mut writer = RotatingWriter::new(&base, max_file_size, max_total_size).unwrap();
+        let mut writer = DiskWriter::new(&base, max_file_size, max_total_size).unwrap();
 
         for _ in 0..10 {
             writer.write_encoded_batch(&test_batch()).unwrap();
@@ -1107,79 +1163,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rotating_writer_enforces_budget_across_restarts() {
-        let dir = TempDir::new().unwrap();
-        let base = dir.path().join("trace");
-        let one_event = single_event_file_size();
-        let max_file_size = one_event;
-        let max_total_size = max_file_size * 3;
-
-        let mut first = RotatingWriter::new(&base, max_file_size, max_total_size).unwrap();
-        for _ in 0..3 {
-            first.write_encoded_batch(&test_batch()).unwrap();
-        }
-        first.finalize().unwrap();
-
-        // Simulate the background worker replacing one sealed segment with a
-        // write-back artifact before the process restarts.
-        let first_segment = dir.path().join("trace.0.bin");
-        let first_segment_gz = dir.path().join("trace.0.bin.gz");
-        std::fs::rename(&first_segment, &first_segment_gz).unwrap();
-        let highest_retained_index = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .filter_map(|entry| {
-                let file_name = entry.file_name();
-                let file_name = file_name.to_str()?;
-                match RotatingWriter::parse_segment_artifact(file_name, "trace") {
-                    Some(SegmentArtifact::Retained { index }) => Some(index),
-                    _ => None,
-                }
-            })
-            .max()
-            .unwrap();
-
-        let mut second = RotatingWriter::new(&base, max_file_size, max_total_size).unwrap();
-        assert_eq!(
-            second.current_active_path(),
-            dir.path()
-                .join(format!("trace.{}.bin.active", highest_retained_index + 1)),
-            "restart should continue after the highest retained segment"
-        );
-
-        second.write_encoded_batch(&test_batch()).unwrap();
-        second.finalize().unwrap();
-
-        assert!(
-            total_disk_usage(dir.path()) <= max_total_size,
-            "restart should keep the total retained trace set within budget"
-        );
-        assert!(
-            !first_segment_gz.exists(),
-            "oldest retained artifact should be evicted after restart"
-        );
-    }
-
-    #[test]
-    fn test_rotating_writer_discards_stale_active_segments_on_restart() {
-        let dir = TempDir::new().unwrap();
-        let base = dir.path().join("trace");
-        std::fs::write(dir.path().join("trace.4.bin"), b"sealed").unwrap();
-        std::fs::write(dir.path().join("trace.7.bin.active"), b"stale").unwrap();
-
-        let writer = RotatingWriter::new(&base, 1024, 4096).unwrap();
-
-        assert_eq!(
-            writer.current_active_path(),
-            dir.path().join("trace.5.bin.active")
-        );
-        assert!(
-            !dir.path().join("trace.7.bin.active").exists(),
-            "stale active segments are not worker-readable and should be discarded"
-        );
-    }
-
-    #[test]
     fn test_rotating_writer_stops_when_over_budget() {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
@@ -1187,7 +1170,7 @@ mod tests {
         // Small file size to force rotation, total budget fits ~1 file
         let max_file_size = one_event;
         let max_total_size = one_event + 5;
-        let mut writer = RotatingWriter::new(&base, max_file_size, max_total_size).unwrap();
+        let mut writer = DiskWriter::new(&base, max_file_size, max_total_size).unwrap();
 
         for _ in 0..100 {
             writer.write_encoded_batch(&test_batch()).unwrap();
@@ -1230,7 +1213,7 @@ mod tests {
         let max_file_size = 200;
         let num_files = 100u64;
         let max_total_size = max_file_size * num_files;
-        let mut writer = RotatingWriter::new(&base, max_file_size, max_total_size).unwrap();
+        let mut writer = DiskWriter::new(&base, max_file_size, max_total_size).unwrap();
 
         // Write many batches. The batch size doesn't divide evenly into
         // (max_file_size - header), so each file wastes a few bytes. After
@@ -1255,7 +1238,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
         let one_event = single_event_file_size();
-        let mut writer = RotatingWriter::new(&base, one_event, 100_000).unwrap();
+        let mut writer = DiskWriter::new(&base, one_event, 100_000).unwrap();
 
         for _ in 0..5 {
             writer.write_encoded_batch(&test_batch()).unwrap();
@@ -1286,7 +1269,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
         let one_event = single_event_file_size();
-        let mut writer = RotatingWriter::new(&base, one_event, 100_000).unwrap();
+        let mut writer = DiskWriter::new(&base, one_event, 100_000).unwrap();
 
         for _ in 0..3 {
             writer.write_encoded_batch(&test_batch()).unwrap();
@@ -1312,7 +1295,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
         let one_event = single_event_file_size();
-        let mut writer = RotatingWriter::new(&base, one_event, 100_000).unwrap();
+        let mut writer = DiskWriter::new(&base, one_event, 100_000).unwrap();
 
         for _ in 0..3 {
             writer.write_encoded_batch(&test_batch()).unwrap();
@@ -1338,7 +1321,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
         // Total budget smaller than one file — stops immediately
-        let mut writer = RotatingWriter::new(&base, 10_000, 50).unwrap();
+        let mut writer = DiskWriter::new(&base, 10_000, 50).unwrap();
 
         for _ in 0..5 {
             writer.write_encoded_batch(&test_batch()).unwrap();
@@ -1353,7 +1336,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
         let one_event = single_event_file_size();
-        let mut writer = RotatingWriter::new(&base, one_event, 100_000).unwrap();
+        let mut writer = DiskWriter::new(&base, one_event, 100_000).unwrap();
 
         for _ in 0..3 {
             writer.write_encoded_batch(&test_batch()).unwrap();
@@ -1377,7 +1360,7 @@ mod tests {
         let base = dir.path().join("trace");
         let one_event = single_event_file_size();
         // Exactly fits one event file — second event triggers rotation
-        let mut writer = RotatingWriter::new(&base, one_event, 100_000).unwrap();
+        let mut writer = DiskWriter::new(&base, one_event, 100_000).unwrap();
 
         for _ in 0..2 {
             writer.write_encoded_batch(&test_batch()).unwrap();
@@ -1402,7 +1385,7 @@ mod tests {
     fn test_active_suffix_while_writing() {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
-        let mut writer = RotatingWriter::new(&base, 1024, 100000).unwrap();
+        let mut writer = DiskWriter::new(&base, 1024, 100000).unwrap();
         writer.write_encoded_batch(&test_batch()).unwrap();
         writer.flush().unwrap();
 
@@ -1418,7 +1401,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
         let one_event = single_event_file_size();
-        let mut writer = RotatingWriter::new(&base, one_event, 100_000).unwrap();
+        let mut writer = DiskWriter::new(&base, one_event, 100_000).unwrap();
 
         // Write 2 events — triggers rotation after first
         writer.write_encoded_batch(&test_batch()).unwrap();
@@ -1448,7 +1431,7 @@ mod tests {
     fn test_finalize_renames_current_file() {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
-        let mut writer = RotatingWriter::new(&base, 1024, 100000).unwrap();
+        let mut writer = DiskWriter::new(&base, 1024, 100000).unwrap();
         writer.write_encoded_batch(&test_batch()).unwrap();
         writer.finalize().unwrap();
 
@@ -1467,7 +1450,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
         // Small max_file_size so one event triggers rotation.
-        let mut writer = RotatingWriter::new(&base, 1, 100_000).unwrap();
+        let mut writer = DiskWriter::new(&base, 1, 100_000).unwrap();
         // Write an event — this fills segment 0 and triggers rotation to segment 1.
         writer.write_encoded_batch(&test_batch()).unwrap();
         // Segment 0 is sealed, segment 1 is active with only header + metadata.
@@ -1492,7 +1475,7 @@ mod tests {
     fn test_single_file_no_active_suffix() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.bin");
-        let mut writer = RotatingWriter::single_file(&path).unwrap();
+        let mut writer = DiskWriter::single_file(&path).unwrap();
         writer.write_encoded_batch(&test_batch()).unwrap();
         writer.flush().unwrap();
         writer.finalize().unwrap();
@@ -1508,7 +1491,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("trace.bin");
-        let mut writer = RotatingWriter::single_file(&path).unwrap();
+        let mut writer = DiskWriter::single_file(&path).unwrap();
         writer.write_encoded_batch(&test_batch()).unwrap();
         writer.flush().unwrap();
         writer.finalize().unwrap();
@@ -1526,7 +1509,7 @@ mod tests {
     fn test_segment_metadata_roundtrip() {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
-        let mut writer = RotatingWriter::builder()
+        let mut writer = DiskWriter::builder()
             .base_path(&base)
             .max_file_size(100_000)
             .max_total_size(100_000)
@@ -1576,7 +1559,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
         let one_event = single_event_file_size();
-        let mut writer = RotatingWriter::builder()
+        let mut writer = DiskWriter::builder()
             .base_path(&base)
             .max_file_size(one_event)
             .max_total_size(100_000)
@@ -1614,7 +1597,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
         let one_event = single_event_file_size();
-        let mut writer = RotatingWriter::builder()
+        let mut writer = DiskWriter::builder()
             .base_path(&base)
             .max_file_size(one_event)
             .max_total_size(100_000)
@@ -1678,7 +1661,7 @@ mod tests {
     fn test_segment_metadata_empty_entries() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("trace.bin");
-        let mut writer = RotatingWriter::single_file(&path).unwrap();
+        let mut writer = DiskWriter::single_file(&path).unwrap();
         writer.write_encoded_batch(&test_batch()).unwrap();
         writer.flush().unwrap();
 
@@ -1718,7 +1701,7 @@ mod tests {
         let max_file_size = one_event;
         // Budget fits many files so segment 0 is not immediately evicted.
         let max_total_size = max_file_size * 100;
-        let mut writer = RotatingWriter::new(&base, max_file_size, max_total_size).unwrap();
+        let mut writer = DiskWriter::new(&base, max_file_size, max_total_size).unwrap();
 
         // Write two batches: the first fills segment 0, the second triggers
         // rotation (sealing segment 0 as trace.0.bin) and starts segment 1.
@@ -1753,7 +1736,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
-        let mut writer = RotatingWriter::builder()
+        let mut writer = DiskWriter::builder()
             .base_path(&base)
             .max_file_size(u64::MAX)
             .max_total_size(100_000)
@@ -1804,7 +1787,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
-        let mut writer = RotatingWriter::builder()
+        let mut writer = DiskWriter::builder()
             .base_path(&base)
             .max_file_size(u64::MAX)
             .max_total_size(100_000)
@@ -1850,7 +1833,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
-        let mut writer = RotatingWriter::builder()
+        let mut writer = DiskWriter::builder()
             .base_path(&base)
             .max_file_size(u64::MAX)
             .max_total_size(100_000)
@@ -1879,7 +1862,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
         let one_event = single_event_file_size();
-        let mut writer = RotatingWriter::builder()
+        let mut writer = DiskWriter::builder()
             .base_path(&base)
             .max_file_size(one_event)
             .max_total_size(100_000)
@@ -1913,7 +1896,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
         let one_event = single_event_file_size();
-        let mut writer = RotatingWriter::builder()
+        let mut writer = DiskWriter::builder()
             .base_path(&base)
             .max_file_size(u64::MAX)
             .max_total_size(one_event * 3)
@@ -1939,7 +1922,7 @@ mod tests {
     fn test_builder_rotation_period_default() {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
-        let writer = RotatingWriter::builder()
+        let writer = DiskWriter::builder()
             .base_path(&base)
             .max_file_size(1024)
             .max_total_size(100_000)
@@ -1952,7 +1935,7 @@ mod tests {
     fn test_new_uses_default_rotation_period() {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
-        let writer = RotatingWriter::new(&base, 1024, 100_000).unwrap();
+        let writer = DiskWriter::new(&base, 1024, 100_000).unwrap();
         assert_eq!(writer.rotation_period, DEFAULT_ROTATION_PERIOD);
     }
 
@@ -1963,7 +1946,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
-        let mut writer = RotatingWriter::builder()
+        let mut writer = DiskWriter::builder()
             .base_path(&base)
             .max_file_size(u64::MAX)
             .max_total_size(100_000)
@@ -1997,7 +1980,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
-        let mut writer = RotatingWriter::builder()
+        let mut writer = DiskWriter::builder()
             .base_path(&base)
             .max_file_size(u64::MAX)
             .max_total_size(100_000)
@@ -2034,7 +2017,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
-        let mut writer = RotatingWriter::builder()
+        let mut writer = DiskWriter::builder()
             .base_path(&base)
             .max_file_size(100_000)
             .max_total_size(100_000)
@@ -2078,7 +2061,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
-        let mut writer = RotatingWriter::builder()
+        let mut writer = DiskWriter::builder()
             .base_path(&base)
             .max_file_size(100_000)
             .max_total_size(100_000)
@@ -2113,7 +2096,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
         let one_event = single_event_file_size();
-        let mut writer = RotatingWriter::builder()
+        let mut writer = DiskWriter::builder()
             .base_path(&base)
             .max_file_size(one_event)
             .max_total_size(100_000)
@@ -2186,7 +2169,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
-        let mut writer = RotatingWriter::builder()
+        let mut writer = DiskWriter::builder()
             .base_path(&base)
             .max_file_size(100_000)
             .max_total_size(100_000)
@@ -2253,7 +2236,7 @@ mod tests {
     fn test_update_segment_metadata_appears_in_trace() {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
-        let mut writer = RotatingWriter::new(&base, 100_000, 100_000).unwrap();
+        let mut writer = DiskWriter::new(&base, 100_000, 100_000).unwrap();
 
         // Simulate TelemetryCore::new setting S3 metadata
         writer.update_segment_metadata(vec![
@@ -2297,7 +2280,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
         let one_event = single_event_file_size();
-        let mut writer = RotatingWriter::new(&base, one_event, 100_000).unwrap();
+        let mut writer = DiskWriter::new(&base, one_event, 100_000).unwrap();
 
         // Step 1: S3 metadata set (like TelemetryCore::new)
         writer.update_segment_metadata(vec![
@@ -2355,7 +2338,7 @@ mod tests {
     fn test_update_segment_metadata_no_op_when_unchanged() {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
-        let mut writer = RotatingWriter::new(&base, 100_000, 100_000).unwrap();
+        let mut writer = DiskWriter::new(&base, 100_000, 100_000).unwrap();
 
         let entries = vec![("k".into(), "v".into())];
         writer.update_segment_metadata(entries.clone());
@@ -2387,7 +2370,7 @@ mod tests {
     fn test_dial9_version_in_segment_metadata() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("trace.bin");
-        let mut writer = RotatingWriter::single_file(&path).unwrap();
+        let mut writer = DiskWriter::single_file(&path).unwrap();
         writer.write_encoded_batch(&test_batch()).unwrap();
         writer.flush().unwrap();
         writer.finalize().unwrap();
@@ -2417,7 +2400,7 @@ mod tests {
     fn test_dial9_version_user_override_wins() {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
-        let mut writer = RotatingWriter::builder()
+        let mut writer = DiskWriter::builder()
             .base_path(&base)
             .max_file_size(100_000)
             .max_total_size(100_000)
@@ -2468,7 +2451,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
-        let mut writer = RotatingWriter::builder()
+        let mut writer = DiskWriter::builder()
             .base_path(&base)
             .max_file_size(u64::MAX)
             .max_total_size(100_000)
@@ -2531,7 +2514,7 @@ mod tests {
         let trace_dir = dir.path().join("traces");
         std::fs::create_dir_all(&trace_dir).unwrap();
         let base = trace_dir.join("trace");
-        let mut writer = RotatingWriter::builder()
+        let mut writer = DiskWriter::builder()
             .base_path(&base)
             .max_file_size(u64::MAX)
             .max_total_size(100_000)
@@ -2562,5 +2545,201 @@ mod tests {
         tokio::time::advance(Duration::from_millis(5)).await;
         let _ = writer.drained();
         assert!(!writer.should_drain());
+    }
+
+    /// Across a process restart, retained `.bin`/`.bin.gz` artifacts from the
+    /// previous lifetime must count toward `max_total_size`. Without this, a
+    /// crash-restart loop grows the trace directory unbounded.
+    #[test]
+    fn test_restart_seeds_closed_files_and_evicts() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("trace");
+        // Lifetime 1: write a few sealed segments.
+        let one_event = single_event_file_size();
+        {
+            let mut w = DiskWriter::new(&base, one_event, 100_000).unwrap();
+            for _ in 0..4 {
+                w.write_encoded_batch(&test_batch()).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        let bin_count_before = (0..20)
+            .filter(|i| std::path::Path::new(&rotating_file(&base, *i)).exists())
+            .count();
+        assert!(
+            bin_count_before >= 2,
+            "lifetime 1 should leave multiple sealed segments"
+        );
+
+        // Lifetime 2: shrink the budget so existing artifacts must be evicted.
+        let new_budget = one_event + 1; // fits ~1 retained segment + the new active one
+        let writer = DiskWriter::new(&base, one_event, new_budget).unwrap();
+        // Discovery + immediate evict_oldest should have shed older segments.
+        assert!(
+            total_disk_usage(dir.path()) <= new_budget,
+            "disk usage exceeds shrunk budget after restart: {}",
+            total_disk_usage(dir.path())
+        );
+        // Next active index must not collide with retained segments.
+        let next_active_path = writer.current_active_path();
+        assert!(next_active_path.exists());
+        assert!(
+            next_active_path
+                .to_str()
+                .is_some_and(|s| s.ends_with(".bin.active"))
+        );
+    }
+
+    /// Stale `.active` files from a dead writer can't be processed by the
+    /// worker — they must be cleaned up on startup so the next writer doesn't
+    /// trip over orphaned indices.
+    #[test]
+    fn test_restart_discards_stale_active_files() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("trace");
+        // Simulate an orphan from a previous, crashed writer.
+        let orphan = dir.path().join("trace.99.bin.active");
+        std::fs::write(&orphan, b"orphaned").unwrap();
+
+        let _w = DiskWriter::new(&base, 1024, 100_000).unwrap();
+        assert!(
+            !orphan.exists(),
+            "stale .active should be discarded on construction"
+        );
+    }
+
+    /// `.bin.gz` write-back siblings must count toward the eviction budget so
+    /// post-processing doesn't push retention past the cap.
+    #[test]
+    fn test_restart_counts_gz_siblings_toward_budget() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("trace");
+        // Simulate a previous lifetime where WriteBack produced a .bin.gz.
+        let bin = dir.path().join("trace.0.bin");
+        let gz = dir.path().join("trace.0.bin.gz");
+        std::fs::write(&bin, vec![0u8; 4096]).unwrap();
+        std::fs::write(&gz, vec![0u8; 1024]).unwrap();
+
+        // Budget too small for both. Restart must evict the whole family.
+        let _w = DiskWriter::new(&base, 100_000, 100).unwrap();
+        assert!(!bin.exists(), ".bin should be evicted under restart budget");
+        assert!(!gz.exists(), ".bin.gz must be evicted with its .bin family");
+    }
+
+    /// finalize() must run eviction so the final sealed segment counts toward
+    /// the budget. Without it, finalize can leave the directory over cap.
+    #[test]
+    fn test_finalize_evicts_to_budget() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("trace");
+        let one_event = single_event_file_size();
+        let max_total_size = one_event * 2;
+        let mut writer = DiskWriter::new(&base, one_event, max_total_size).unwrap();
+
+        for _ in 0..10 {
+            writer.write_encoded_batch(&test_batch()).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        assert!(
+            total_disk_usage(dir.path()) <= max_total_size,
+            "finalize must leave disk usage within budget"
+        );
+    }
+
+    #[test]
+    fn in_memory_builder_wires_custom_options() {
+        use crate::telemetry::InMemoryWriter;
+        let writer = InMemoryWriter::builder()
+            .max_total_size(8 * 1024 * 1024)
+            .max_segment_size(64 * 1024)
+            .rotation_period(Duration::from_secs(30))
+            .segment_metadata(vec![("svc".into(), "test".into())])
+            .build()
+            .unwrap();
+        assert_eq!(writer.max_file_size, 64 * 1024);
+        assert_eq!(writer.rotation_period, Duration::from_secs(30));
+        assert!(
+            writer
+                .segment_metadata
+                .entries
+                .iter()
+                .any(|(k, v)| k == "svc" && v == "test")
+        );
+    }
+
+    #[test]
+    fn in_memory_rejects_zero_total_size() {
+        let err = InMemoryWriter::new(0).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn in_memory_builder_enforces_3x_segment_min_total_size() {
+        let seg: u64 = 2048;
+        // Below the boundary: rejected (no room for even one ring slot).
+        let err = InMemoryWriter::builder()
+            .max_total_size(3 * seg - 1)
+            .max_segment_size(seg)
+            .build()
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        // At boundary: accepted (1 active + 1 in-flight + 1 ring slot).
+        InMemoryWriter::builder()
+            .max_total_size(3 * seg)
+            .max_segment_size(seg)
+            .build()
+            .expect("3× segment must be accepted");
+    }
+
+    /// End to end: a memory `SegmentWriter` feeds the real worker pipeline.
+    /// Bytes must decode and every written event must arrive. Exercises the
+    /// full seam: in_memory -> write -> Fs::Mem seal -> ring -> finalize
+    /// (mark_writer_done) -> WorkerLoop::run drain-to-empty -> processor.
+    #[tokio::test]
+    async fn mem_writer_e2e_delivers_all_events() {
+        use crate::background_task::WorkerLoop;
+        use crate::background_task::testutil::CaptureProcessor;
+        use crate::telemetry::{TelemetryEvent, format};
+
+        const EVENTS: usize = 25;
+
+        let mut writer = InMemoryWriter::new(1 << 20).unwrap();
+        let fs = writer.fs_handle().expect("memory writer exposes its Fs");
+
+        for _ in 0..EVENTS {
+            writer.write_encoded_batch(&test_batch()).unwrap();
+        }
+        // Seals the active segment onto the ring and signals writer_done.
+        writer.finalize().unwrap();
+
+        let (capture, captured) = CaptureProcessor::new();
+        // stop is never cancelled: the loop exits via writer_done only.
+        let stop = tokio_util::sync::CancellationToken::new();
+        let mut worker = WorkerLoop::new(
+            fs,
+            Duration::from_millis(5),
+            vec![Box::new(capture)],
+            stop,
+            metrique_writer::sink::DevNullSink::boxed(),
+        );
+        worker.run().await;
+
+        let bytes = captured.lock().unwrap().clone();
+        assert!(!bytes.is_empty(), "worker captured no bytes");
+        let events = format::decode_events(&bytes)
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                !matches!(
+                    e,
+                    TelemetryEvent::SegmentMetadata { .. } | TelemetryEvent::ClockSync { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            events, EVENTS,
+            "every written event must reach the processor"
+        );
     }
 }

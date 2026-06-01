@@ -1,6 +1,6 @@
 [package]
 name = "dial9-tokio-telemetry"
-version = "0.3.13"
+version = "0.4.0-alpha.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -161,6 +161,11 @@ harness = false
 name = "memory_profiling_bench"
 harness = false
 required-features = ["memory-profiling"]
+
+[[bench]]
+name = "pipeline_heap_bench"
+harness = false
+required-features = ["cpu-profiling"]
 
 [[example]]
 name = "blocking_pool_tracking"

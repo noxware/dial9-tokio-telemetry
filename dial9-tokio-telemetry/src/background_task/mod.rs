@@ -1,17 +1,24 @@
 #[cfg(feature = "worker-s3")]
 pub(crate) mod connection;
+pub(crate) mod fs;
 pub mod instance_metadata;
 mod payload;
 pub(crate) mod pipeline_metrics;
 #[cfg(feature = "worker-s3")]
 pub mod s3;
 pub(crate) mod sealed;
+#[cfg(test)]
+pub(crate) mod testutil;
 
 pub use payload::Payload;
-pub use sealed::SealedSegment;
+pub use sealed::{MemorySegment, SealedSegment, SegmentRef};
 
-use crate::metrics::{Operation, SegmentProcessMetrics, SegmentProcessMetricsGuard};
+use crate::background_task::fs::{Fs, RemoveReason, SegmentAccounting, TakenFiles, TakenSegment};
+use crate::metrics::{
+    Operation, SegmentProcessMetrics, SegmentProcessMetricsGuard, WorkerCycleMetrics,
+};
 use crate::rate_limit::rate_limited;
+use crate::telemetry::writer::{Disk, WriterMode};
 use futures_util::FutureExt;
 use metrique::timers::Timer;
 use metrique_writer::BoxEntrySink;
@@ -19,8 +26,10 @@ use pipeline_metrics::{MetriqueResult, PipelineMetrics, StageMetrics};
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -32,9 +41,10 @@ pub(crate) const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
 pub struct BackgroundTaskConfig {
-    /// The trace base path (same path passed to `RotatingWriter::new`).
+    /// The trace base path (same path passed to `DiskWriter::new`).
+    /// `None` when using the in-memory backend.
     #[builder(into)]
-    trace_path: PathBuf,
+    trace_path: Option<PathBuf>,
     /// How often the worker checks for sealed segments. Defaults to 1 second.
     #[builder(default = DEFAULT_POLL_INTERVAL)]
     poll_interval: Duration,
@@ -61,9 +71,16 @@ impl BackgroundTaskConfig {
         self.poll_interval
     }
 
+    /// The full trace base path (e.g. `/tmp/trace.bin`). `None` for memory
+    /// mode.
+    #[cfg(test)]
+    pub(crate) fn trace_path(&self) -> Option<&Path> {
+        self.trace_path.as_deref()
+    }
+
     /// Directory containing trace segments.
     pub fn trace_dir(&self) -> &Path {
-        match self.trace_path.parent() {
+        match self.trace_path.as_deref().and_then(|p| p.parent()) {
             Some(parent) if !parent.as_os_str().is_empty() => parent,
             _ => Path::new("."),
         }
@@ -71,17 +88,24 @@ impl BackgroundTaskConfig {
 
     /// File stem used for segment matching (e.g. "trace" for "trace.0.bin").
     pub fn trace_stem(&self) -> &str {
-        let stem = self.trace_path.file_stem().and_then(|s| s.to_str());
+        let stem = self
+            .trace_path
+            .as_deref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty());
         match stem {
-            Some(s) if !s.is_empty() => s,
-            _ => {
-                rate_limited!(Duration::from_secs(60), {
-                    tracing::error!(
-                        target: "dial9_worker",
-                        path = %self.trace_path.display(),
-                        "trace_path has no file stem — pass a path like /tmp/traces/trace.bin, not a directory"
-                    );
-                });
+            Some(s) => s,
+            None => {
+                if let Some(p) = self.trace_path.as_deref() {
+                    rate_limited!(Duration::from_secs(60), {
+                        tracing::error!(
+                            target: "dial9_worker",
+                            path = %p.display(),
+                            "trace_path has no file stem — pass a path like /tmp/traces/trace.bin, not a directory"
+                        );
+                    });
+                }
                 "trace"
             }
         }
@@ -94,19 +118,27 @@ impl BackgroundTaskConfig {
 
 /// Data flowing through the processor pipeline.
 ///
-/// The worker reads the sealed segment file into `payload`, populates initial
+/// The worker reads the sealed segment into `payload`, populates initial
 /// `metadata`, then passes this through each [`SegmentProcessor`] in order.
 /// Metrics are flushed automatically when the `SegmentData` is dropped.
+///
+/// `SegmentData` is intentionally `!Clone`, it is moved through the pipeline
+/// and dropped exactly once, which is crucial for `SegmentAccounting`'s
+/// in-flight byte accounting (a single `Drop` decrements the counters).
 pub struct SegmentData {
-    pub(crate) segment: SealedSegment,
+    pub(crate) segment: SegmentRef,
     pub(crate) payload: Payload,
     pub(crate) metadata: HashMap<String, String>,
     pub(crate) metrics: SegmentProcessMetricsGuard,
+    /// Memory-mode in-flight accounting. `None` for disk-backed segments.
+    /// Held only for its `Drop` (releases in-flight counters).
+    #[allow(dead_code)]
+    pub(crate) accounting: Option<SegmentAccounting>,
 }
 
 impl SegmentData {
     /// Information about the sealed segment being processed.
-    pub fn segment(&self) -> &SealedSegment {
+    pub fn segment(&self) -> &SegmentRef {
         &self.segment
     }
 
@@ -285,11 +317,11 @@ pub trait SegmentProcessor: Send {
 
 /// Closure-scoped builder for assembling a custom processor pipeline.
 ///
-/// Obtained via `with_custom_pipeline(|p| ...)` on the runtime builder.
-/// Built-in processors are reachable through dedicated methods
-/// ([`gzip`](Self::gzip), [`write_back`](Self::write_back),
-/// [`s3`](Self::s3), [`symbolize`](Self::symbolize)); custom processors
-/// are added with [`pipe`](Self::pipe).
+/// Obtained via `with_custom_pipeline(|p| ...)` on the runtime builder. The
+/// `Mode` type parameter binds the pipeline to the writer's storage mode:
+/// disk-only processors like [`write_back`](Self::write_back) are not in
+/// scope on `PipelineBuilder<Memory>`, so wiring write-back into an
+/// in-memory pipeline is a compile error.
 ///
 /// # Example
 ///
@@ -310,14 +342,16 @@ pub trait SegmentProcessor: Send {
 /// builder.with_custom_pipeline(|p| p.pipe(Logger).gzip().write_back())
 /// ```
 #[must_use]
-pub struct PipelineBuilder {
+pub struct PipelineBuilder<Mode: WriterMode = Disk> {
     processors: Vec<Box<dyn SegmentProcessor>>,
+    _marker: PhantomData<Mode>,
 }
 
-impl PipelineBuilder {
+impl<Mode: WriterMode> PipelineBuilder<Mode> {
     pub(crate) fn new() -> Self {
         Self {
             processors: Vec::new(),
+            _marker: PhantomData,
         }
     }
 
@@ -337,14 +371,6 @@ impl PipelineBuilder {
     /// Gzip the segment payload in-memory.
     pub fn gzip(mut self) -> Self {
         self.processors.push(Box::new(GzipCompressor));
-        self
-    }
-
-    /// Write the current payload bytes back to disk. When the payload has
-    /// been gzipped earlier in the pipeline, the file is written with a
-    /// `.gz` suffix and the original sealed segment is removed.
-    pub fn write_back(mut self) -> Self {
-        self.processors.push(Box::new(WriteBackProcessor));
         self
     }
 
@@ -385,7 +411,18 @@ impl PipelineBuilder {
     }
 }
 
-impl std::fmt::Debug for PipelineBuilder {
+/// Disk-only methods on the pipeline builder.
+impl PipelineBuilder<Disk> {
+    /// Write the current payload bytes back to disk. When the payload has
+    /// been gzipped earlier in the pipeline, the file is written with a
+    /// `.gz` suffix and the original sealed segment is removed.
+    pub fn write_back(mut self) -> Self {
+        self.processors.push(Box::new(WriteBackProcessor));
+        self
+    }
+}
+
+impl<Mode: WriterMode> std::fmt::Debug for PipelineBuilder<Mode> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PipelineBuilder")
             .field("len", &self.processors.len())
@@ -401,6 +438,7 @@ impl std::fmt::Debug for PipelineBuilder {
 pub(crate) fn run_background_task(
     mut config: BackgroundTaskConfig,
     shutdown: tokio::sync::oneshot::Receiver<Duration>,
+    fs: Arc<Fs>,
 ) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .thread_name("dial9-worker-rt")
@@ -414,7 +452,13 @@ pub(crate) fn run_background_task(
     tracing::info!(target: "dial9_worker", dir = %config.trace_dir().display(), stem = %config.trace_stem(), processors = processors.len(), "worker started");
     rt.block_on(async {
         let stop = tokio_util::sync::CancellationToken::new();
-        let mut worker = WorkerLoop::new(config, processors, stop.clone(), metrics_sink);
+        let mut worker = WorkerLoop::new(
+            fs,
+            config.poll_interval(),
+            processors,
+            stop.clone(),
+            metrics_sink,
+        );
         let mut run_fut = std::pin::pin!(worker.run());
         // Poll the worker until we receive a shutdown signal with a drain timeout.
         let drain_timeout = tokio::select! {
@@ -586,7 +630,18 @@ impl SegmentProcessor for WriteBackProcessor {
         data: SegmentData,
     ) -> Pin<Box<dyn Future<Output = Result<SegmentData, ProcessError>> + Send + '_>> {
         Box::pin(async move {
-            let original_path = data.segment.path.clone();
+            let original_path = match data.segment.disk_path() {
+                Some(p) => p.to_owned(),
+                None => {
+                    return Err(ProcessError::io(
+                        data,
+                        std::io::Error::other(
+                            "WriteBackProcessor requires a disk-backed segment; \
+                             memory-backed segments must not use write_back()",
+                        ),
+                    ));
+                }
+            };
             let dest_path = match data.metadata.get("write_back_extension") {
                 Some(ext) => {
                     let mut p = original_path.as_os_str().to_owned();
@@ -647,8 +702,7 @@ impl SegmentProcessor for WriteBackProcessor {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct WorkerLoop {
-    dir: PathBuf,
-    stem: String,
+    fs: Arc<Fs>,
     poll_interval: Duration,
     processors: Vec<Box<dyn SegmentProcessor>>,
     metrics_sink: BoxEntrySink,
@@ -659,15 +713,15 @@ pub(crate) struct WorkerLoop {
 
 impl WorkerLoop {
     pub(crate) fn new(
-        config: BackgroundTaskConfig,
+        fs: Arc<Fs>,
+        poll_interval: Duration,
         processors: Vec<Box<dyn SegmentProcessor>>,
         stop: tokio_util::sync::CancellationToken,
         metrics_sink: BoxEntrySink,
     ) -> Self {
         Self {
-            dir: config.trace_dir().to_path_buf(),
-            stem: config.trace_stem().to_string(),
-            poll_interval: config.poll_interval(),
+            fs,
+            poll_interval,
             processors,
             metrics_sink,
             stop,
@@ -676,72 +730,87 @@ impl WorkerLoop {
 
     pub(crate) async fn run(&mut self) {
         loop {
-            let segments_found = self.process_open_segments().await;
-            if self.stop.is_cancelled() {
-                // One final scan to pick up segments sealed after our last
-                // directory listing (the flush thread is joined before the
-                // stop signal, so one extra pass is sufficient).
-                self.process_open_segments().await;
-                tracing::debug!(target: "dial9_worker", "Exiting run loop: cancellation received");
-                return;
-            }
-            if !segments_found {
-                tokio::select! {
-                    _ = self.stop.cancelled() => {}
-                    _ = tokio::time::sleep(self.poll_interval) => {}
+            let taken = self.fs.take_files();
+            let dispatched = taken.segments.len() as u64;
+            self.emit_cycle_metrics(&taken, dispatched);
+            self.process_segments(taken.segments).await;
+
+            if self.stop.is_cancelled() || self.fs.writer_done() {
+                // Drain-to-empty: keep popping until the ring/directory is clear.
+                // Ordering invariant: writer calls mark_writer_done (Release) after
+                // the seal-time queue push, so any late-racing push is visible here.
+                loop {
+                    let taken = self.fs.take_files();
+                    let dispatched = taken.segments.len() as u64;
+                    self.emit_cycle_metrics(&taken, dispatched);
+                    if taken.segments.is_empty() {
+                        tracing::debug!(target: "dial9_worker", "Exiting run loop: drain complete");
+                        return;
+                    }
+                    self.process_segments(taken.segments).await;
                 }
             }
+
+            self.fs.wait_for_more(&self.stop, self.poll_interval).await;
         }
     }
 
-    async fn process_open_segments(&mut self) -> bool {
-        let segments = match sealed::find_sealed_segments(&self.dir, &self.stem) {
-            Ok(s) => s,
-            Err(e) => {
-                rate_limited!(Duration::from_secs(60), {
-                    tracing::warn!(target: "dial9_worker", "failed to scan for sealed segments: {e}");
-                });
-                return false;
-            }
-        };
-        tracing::trace!(target: "dial9_worker", dir = %self.dir.display(), stem = %self.stem, count = segments.len(), "scanned for sealed segments");
-        let found = !segments.is_empty();
-        self.process_segments(&segments).await;
+    // Test-only: prod drains via the `run()` shutdown loop
+    // (stop/writer_done -> drain-to-empty). This just forces one synchronous
+    // drain cycle for unit tests.
+    #[cfg(test)]
+    pub(crate) async fn process_open_segments(&mut self) -> bool {
+        let taken = self.fs.take_files();
+        let found = !taken.segments.is_empty();
+        let dispatched = taken.segments.len() as u64;
+        self.emit_cycle_metrics(&taken, dispatched);
+        self.process_segments(taken.segments).await;
         found
     }
 
-    async fn process_segments(&mut self, segments: &[sealed::SealedSegment]) {
+    async fn process_segments(&mut self, segments: Vec<TakenSegment>) {
         if self.processors.is_empty() {
             return;
         }
 
-        'next_segment: for (seg_idx, segment) in segments.iter().enumerate() {
-            tracing::debug!(target: "dial9_worker", segment = seg_idx + 1, total = segments.len(), path = %segment.path.display(), "processing segment");
-            let uncompressed_size = std::fs::metadata(&segment.path)
-                .map(|m| m.len())
-                .unwrap_or(0);
-
-            let bytes = match std::fs::read(&segment.path) {
-                Ok(b) => b,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    tracing::debug!(target: "dial9_worker", path = %segment.path.display(), "segment already evicted, skipping");
+        'next_segment: for (seg_idx, taken) in segments.into_iter().enumerate() {
+            // Snapshot memory-only retry state before `load()` consumes
+            // `taken`, so re-dispense on a retryable failure gets the same bytes as the first attempt.
+            let retry_count = taken.retry_count();
+            let original_bytes = taken.original_bytes();
+            let (seg_ref, payload, accounting) = match taken.load() {
+                Ok(t) => t,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    rate_limited!(Duration::from_secs(60), {
+                        tracing::warn!(
+                            target: "dial9_worker",
+                            "segment vanished between scan and load, skipping"
+                        );
+                    });
                     continue;
                 }
                 Err(e) => {
                     rate_limited!(Duration::from_secs(60), {
-                        tracing::warn!(target: "dial9_worker", error = %e, "failed to read segment");
+                        tracing::warn!(target: "dial9_worker", error = %e, "failed to load segment");
                     });
                     continue;
                 }
             };
 
-            let (epoch_secs, header_valid) = sealed::creation_epoch_secs(&bytes, &segment.path);
+            let uncompressed_size = payload.len() as u64;
+            let path_for_header = seg_ref.disk_path().unwrap_or_else(|| Path::new(""));
+            // A freshly loaded segment is always a single chunk holding the
+            // whole payload, so the first chunk is the full byte range the
+            // timestamp parser needs.
+            let header_bytes = payload.chunks().first().map_or(&[][..], |b| b.as_ref());
+            let (epoch_secs, header_valid) =
+                sealed::creation_epoch_secs(header_bytes, path_for_header);
 
             let metrics = SegmentProcessMetrics {
                 operation: Operation::ProcessSegment,
                 total_time: Timer::start_now(),
                 status: None,
-                segment_index: segment.index,
+                segment_index: seg_ref.index(),
                 uncompressed_size,
                 compressed_size: None,
                 invalid_file_header: !header_valid,
@@ -751,14 +820,18 @@ impl WorkerLoop {
             }
             .append_on_drop(self.metrics_sink.clone());
 
+            // Kept for metadata, metrics, and failure logging after `seg_ref`
+            // moves into `data` below.
+            let seg_ref_retained = seg_ref.clone();
             let mut data = SegmentData {
-                segment: segment.clone(),
-                payload: Payload::from_vec(bytes),
+                segment: seg_ref,
+                payload,
                 metadata: HashMap::from([
                     ("epoch_secs".into(), epoch_secs.to_string()),
-                    ("segment_index".into(), segment.index.to_string()),
+                    ("segment_index".into(), seg_ref_retained.index().to_string()),
                 ]),
                 metrics,
+                accounting,
             };
 
             for processor in &mut self.processors {
@@ -781,6 +854,9 @@ impl WorkerLoop {
                     Ok(Ok(next)) => {
                         tracing::debug!(target: "dial9_worker", processor = processor.name(), segment = seg_idx + 1, elapsed_ms = proc_start.elapsed().as_secs_f64() * 1000.0, "processor succeeded");
                         data = next;
+                        if let Some(acct) = data.accounting.as_mut() {
+                            acct.adjust(data.payload.len() as u64);
+                        }
                         stage.succeed();
                         data.metrics.pipeline.push(processor.name(), stage);
                     }
@@ -792,17 +868,48 @@ impl WorkerLoop {
                         data.metrics.status = Some(MetriqueResult::Failure);
                         data.metrics.total_time.stop();
                         if e.kind.already_deleted() {
-                            tracing::debug!(target: "dial9_worker", path = %segment.path.display(), "segment evicted during processing, skipping");
+                            tracing::debug!(target: "dial9_worker", id = %data.segment, "segment evicted during processing, skipping");
                         } else if e.kind.retryable() {
-                            tracing::debug!(target: "dial9_worker", path = %segment.path.display(), err = ?e.kind, "retryable error, this file will be attempted to process again.");
-                        } else {
-                            if let Err(remove_err) = std::fs::remove_file(&segment.path) {
-                                rate_limited!(Duration::from_secs(60), {
-                                    tracing::warn!(target: "dial9_worker", error = %remove_err, path = %segment.path.display(), "failed to remove corrupted segment");
-                                });
+                            match &data.segment {
+                                // Memory segments always carry retry_count + a
+                                // byte snapshot (set in `TakenSegment::memory`).
+                                // If either is missing the invariant broke. In-flight
+                                // is released via `data.accounting` on `continue`.
+                                SegmentRef::Memory(_) => {
+                                    match (retry_count, original_bytes.as_ref()) {
+                                        (Some(prev), Some(bytes)) => {
+                                            let attempt = prev + 1;
+                                            if attempt
+                                                > crate::background_task::fs::MEMORY_RETRY_BUDGET
+                                            {
+                                                rate_limited!(Duration::from_secs(60), {
+                                                    tracing::warn!(target: "dial9_worker", id = %data.segment, err = ?e.kind, budget = crate::background_task::fs::MEMORY_RETRY_BUDGET, "memory retry budget exhausted, dropping segment");
+                                                });
+                                            } else {
+                                                tokio::time::sleep(self.poll_interval).await;
+                                                self.fs.release_for_retry(
+                                                    &data.segment,
+                                                    bytes.clone(),
+                                                    attempt,
+                                                );
+                                            }
+                                        }
+                                        _ => {
+                                            rate_limited!(Duration::from_secs(60), {
+                                                tracing::warn!(target: "dial9_worker", id = %data.segment, "memory segment missing retry state, dropping");
+                                            });
+                                        }
+                                    }
+                                }
+                                SegmentRef::Disk(_) => {
+                                    tracing::debug!(target: "dial9_worker", id = %data.segment, err = ?e.kind, "retryable error");
+                                    self.fs.release_claim(&data.segment);
+                                }
                             }
+                        } else {
+                            self.fs.remove_sealed(&data.segment, RemoveReason::Terminal);
                             rate_limited!(Duration::from_secs(60), {
-                                tracing::warn!(target: "dial9_worker", error = %e.kind, cause = ?e.kind, path = %segment.path.display(), "processor failed, removing segment");
+                                tracing::warn!(target: "dial9_worker", error = %e.kind, cause = ?e.kind, id = %data.segment, "processor failed, removing segment");
                             });
                         }
                         continue 'next_segment;
@@ -819,7 +926,7 @@ impl WorkerLoop {
                                 target: "dial9_worker",
                                 processor = processor.name(),
                                 segment = seg_idx + 1,
-                                path = %segment.path.display(),
+                                id = %seg_ref_retained,
                                 panic = panic_msg,
                                 "processor panicked, skipping segment"
                             )
@@ -832,7 +939,7 @@ impl WorkerLoop {
                                 operation: Operation::ProcessSegment,
                                 total_time: Timer::start_now(),
                                 status: Some(MetriqueResult::Failure),
-                                segment_index: segment.index,
+                                segment_index: seg_ref_retained.index(),
                                 uncompressed_size,
                                 compressed_size: None,
                                 invalid_file_header: !header_valid,
@@ -842,14 +949,8 @@ impl WorkerLoop {
                             }
                             .append_on_drop(self.metrics_sink.clone()),
                         );
-                        if let Err(remove_err) = std::fs::remove_file(&segment.path)
-                            && remove_err.kind() != std::io::ErrorKind::NotFound
-                        {
-                            rate_limited!(
-                                Duration::from_secs(60),
-                                tracing::warn!(target: "dial9_worker", error = %remove_err, path = %segment.path.display(), "failed to remove segment after panic")
-                            );
-                        }
+                        self.fs
+                            .remove_sealed(&seg_ref_retained, RemoveReason::Terminal);
                         continue 'next_segment;
                     }
                 }
@@ -857,8 +958,23 @@ impl WorkerLoop {
 
             data.metrics.status = Some(MetriqueResult::Success);
             data.metrics.total_time.stop();
-            // `data` dropped here — metrics guard flushes automatically
         }
+    }
+
+    fn emit_cycle_metrics(&self, taken: &TakenFiles, segments_dispatched: u64) {
+        drop(
+            WorkerCycleMetrics {
+                operation: Operation::WorkerCycle,
+                memory_queued_segments: taken.queued_segments,
+                memory_queued_bytes: taken.queued_bytes,
+                in_flight_segments: taken.in_flight_segments,
+                in_flight_bytes: taken.in_flight_bytes,
+                memory_peak_in_flight_bytes: taken.in_flight_bytes_peak,
+                segments_evicted: taken.segments_dropped,
+                segments_dispatched,
+            }
+            .append_on_drop(self.metrics_sink.clone()),
+        );
     }
 }
 
@@ -1027,7 +1143,7 @@ impl SegmentProcessor for S3PipelineUploader {
                 });
             };
             if !circuit_breaker.should_attempt() {
-                tracing::debug!(target: "dial9_worker", path = %data.segment.path.display(), "circuit breaker open, skipping upload");
+                tracing::debug!(target: "dial9_worker", segment = %data.segment, "circuit breaker open, skipping upload");
                 return Err(ProcessError {
                     data,
                     kind: ProcessErrorKind::Transfer {
@@ -1051,7 +1167,7 @@ impl SegmentProcessor for S3PipelineUploader {
                 Err(kind) => {
                     if matches!(&kind, ProcessErrorKind::Io(io) if io.kind() == std::io::ErrorKind::NotFound)
                     {
-                        tracing::debug!(target: "dial9_worker", path = %data.segment.path.display(), "segment already evicted, skipping");
+                        tracing::debug!(target: "dial9_worker", segment = %data.segment, "segment already evicted, skipping");
                     } else {
                         circuit_breaker.on_failure();
                         rate_limited!(Duration::from_secs(60), {
@@ -1212,10 +1328,10 @@ mod tests {
             )),
         ];
 
-        let segment = sealed::SealedSegment {
+        let segment = sealed::SegmentRef::Disk(sealed::SealedSegment {
             path: segment_path.clone(),
             index: 0,
-        };
+        });
 
         let metrics = SegmentProcessMetrics {
             operation: Operation::ProcessSegment,
@@ -1239,6 +1355,7 @@ mod tests {
                 ("segment_index".into(), "0".into()),
             ]),
             metrics,
+            accounting: None,
         };
 
         for processor in &mut processors {
@@ -1345,9 +1462,11 @@ mod tests {
                 let counter = self.0.clone();
                 Box::pin(async move {
                     counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let mut done = data.segment.path.as_os_str().to_owned();
-                    done.push(".done");
-                    let _ = std::fs::rename(&data.segment.path, done);
+                    if let Some(p) = data.segment.disk_path() {
+                        let mut done = p.as_os_str().to_owned();
+                        done.push(".done");
+                        let _ = std::fs::rename(p, done);
+                    }
                     Ok(data)
                 })
             }
@@ -1364,7 +1483,8 @@ mod tests {
             vec![Box::new(CountingProcessor(processed.clone()))];
 
         let mut worker = WorkerLoop::new(
-            config,
+            Fs::new_disk(config.trace_path().unwrap()),
+            config.poll_interval(),
             processors,
             stop,
             metrique_writer::sink::DevNullSink::boxed(),
@@ -1409,9 +1529,11 @@ mod tests {
                         })
                     } else {
                         counter.fetch_add(1, Ordering::SeqCst);
-                        let mut done = data.segment.path.as_os_str().to_owned();
-                        done.push(".done");
-                        let _ = std::fs::rename(&data.segment.path, done);
+                        if let Some(p) = data.segment.disk_path() {
+                            let mut done = p.as_os_str().to_owned();
+                            done.push(".done");
+                            let _ = std::fs::rename(p, done);
+                        }
                         Ok(data)
                     }
                 })
@@ -1430,7 +1552,8 @@ mod tests {
         })];
 
         let mut worker = WorkerLoop::new(
-            config,
+            Fs::new_disk(config.trace_path().unwrap()),
+            config.poll_interval(),
             processors,
             stop,
             metrique_writer::sink::DevNullSink::boxed(),
@@ -1501,10 +1624,12 @@ mod worker_pipeline_tests {
     use assert2::check;
     use std::sync::Arc;
 
-    fn config_for(dir: &std::path::Path) -> BackgroundTaskConfig {
-        BackgroundTaskConfig::builder()
-            .trace_path(dir.join("trace.bin"))
-            .build()
+    fn fs_for(dir: &std::path::Path) -> Arc<Fs> {
+        Fs::new_disk(&dir.join("trace.bin"))
+    }
+
+    fn default_poll() -> Duration {
+        Duration::from_secs(1)
     }
 
     /// s3s wrapper where every upload returns 500 InternalError.
@@ -1547,6 +1672,117 @@ mod worker_pipeline_tests {
                 s3s::S3ErrorCode::InternalError,
                 "injected 500",
             ))
+        }
+    }
+
+    /// s3s wrapper that fails the first `fail_n` writes with 500, then
+    /// delegates to the inner backend.
+    struct FlakyS3<S> {
+        inner: S,
+        remaining_failures: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl<S> FlakyS3<S> {
+        fn should_fail(&self) -> bool {
+            use std::sync::atomic::Ordering;
+            let prev = self.remaining_failures.load(Ordering::SeqCst);
+            if prev == 0 {
+                return false;
+            }
+            self.remaining_failures
+                .compare_exchange(prev, prev - 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<S: s3s::S3 + Send + Sync> s3s::S3 for FlakyS3<S> {
+        async fn put_object(
+            &self,
+            req: s3s::S3Request<s3s::dto::PutObjectInput>,
+        ) -> s3s::S3Result<s3s::S3Response<s3s::dto::PutObjectOutput>> {
+            if self.should_fail() {
+                return Err(s3s::S3Error::with_message(
+                    s3s::S3ErrorCode::InternalError,
+                    "injected 500",
+                ));
+            }
+            self.inner.put_object(req).await
+        }
+    }
+
+    struct FlakyHarness {
+        uploader: s3::S3Uploader,
+        fail_counter: Arc<std::sync::atomic::AtomicU32>,
+        s3_root: tempfile::TempDir,
+    }
+
+    /// Read the single object out of the fake S3 bucket. Panics if there
+    /// isn't exactly one. Used to assert uploaded bytes survived retries.
+    fn read_only_object(s3_root: &std::path::Path) -> Vec<u8> {
+        fn walk(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(p) else { return };
+            for entry in rd.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.is_file()
+                    && path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| !n.ends_with(".s3s-fs"))
+                {
+                    out.push(path);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(&s3_root.join("test-bucket"), &mut found);
+        assert_eq!(found.len(), 1, "expected exactly one object, got {found:?}");
+        std::fs::read(&found[0]).unwrap()
+    }
+
+    fn flaky_s3_harness(fail_n: u32) -> FlakyHarness {
+        let s3_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(s3_root.path().join("test-bucket")).unwrap();
+        let fail_counter = Arc::new(std::sync::atomic::AtomicU32::new(fail_n));
+
+        let fs = s3s_fs::FileSystem::new(s3_root.path()).unwrap();
+        let flaky = FlakyS3 {
+            inner: fs,
+            remaining_failures: Arc::clone(&fail_counter),
+        };
+        let mut svc = s3s::service::S3ServiceBuilder::new(flaky);
+        svc.set_auth(s3s::auth::SimpleAuth::from_single("test", "test"));
+        let s3_client: s3s_aws::Client = svc.build().into();
+
+        let sdk_config = aws_sdk_s3::Config::builder()
+            .behavior_version_latest()
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "test", "test", None, None, "test",
+            ))
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            // Disable SDK-internal retries so each worker attempt = 1 PUT.
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .http_client(s3_client)
+            .force_path_style(true)
+            .build();
+        let tm_client = aws_sdk_s3_transfer_manager::Client::new(
+            aws_sdk_s3_transfer_manager::Config::builder()
+                .client(aws_sdk_s3::Client::from_conf(sdk_config))
+                .build(),
+        );
+        let s3_config = s3::S3Config::builder()
+            .bucket("test-bucket")
+            .service_name("test")
+            .instance_path("test")
+            .boot_id("test")
+            .region("us-east-1")
+            .build();
+        FlakyHarness {
+            uploader: s3::S3Uploader::new(tm_client, s3_config),
+            fail_counter,
+            s3_root,
         }
     }
 
@@ -1597,7 +1833,8 @@ mod worker_pipeline_tests {
 
         let stop = tokio_util::sync::CancellationToken::new();
         let mut worker = WorkerLoop::new(
-            config_for(dir.path()),
+            fs_for(dir.path()),
+            default_poll(),
             processors,
             stop,
             metrique_writer::sink::DevNullSink::boxed(),
@@ -1626,7 +1863,8 @@ mod worker_pipeline_tests {
 
         let stop = tokio_util::sync::CancellationToken::new();
         let mut worker = WorkerLoop::new(
-            config_for(dir.path()),
+            fs_for(dir.path()),
+            default_poll(),
             processors,
             stop,
             metrique_writer::sink::DevNullSink::boxed(),
@@ -1673,7 +1911,8 @@ mod worker_pipeline_tests {
         let processors: Vec<Box<dyn SegmentProcessor>> = vec![Box::new(NotFoundProcessor)];
 
         let mut worker = WorkerLoop::new(
-            config_for(dir.path()),
+            fs_for(dir.path()),
+            default_poll(),
             processors,
             stop,
             metrique_writer::sink::DevNullSink::boxed(),
@@ -1718,7 +1957,8 @@ mod worker_pipeline_tests {
         let processors: Vec<Box<dyn SegmentProcessor>> = vec![Box::new(PermanentFailProcessor)];
 
         let mut worker = WorkerLoop::new(
-            config_for(dir.path()),
+            fs_for(dir.path()),
+            default_poll(),
             processors,
             stop,
             metrique_writer::sink::DevNullSink::boxed(),
@@ -1745,33 +1985,16 @@ mod worker_pipeline_tests {
         };
         std::fs::write(dir.path().join("trace.0.bin"), &gzip_data).unwrap();
 
-        let output_bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
-
-        struct CaptureProcessor(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl SegmentProcessor for CaptureProcessor {
-            fn name(&self) -> &'static str {
-                "Capture"
-            }
-            fn process(
-                &mut self,
-                data: SegmentData,
-            ) -> Pin<Box<dyn Future<Output = Result<SegmentData, ProcessError>> + Send + '_>>
-            {
-                *self.0.lock().unwrap() = data.payload.clone().into_vec();
-                Box::pin(async { Ok(data) })
-            }
-        }
-
+        let (capture, output_bytes) = super::testutil::CaptureProcessor::new();
         let stop = tokio_util::sync::CancellationToken::new();
         stop.cancel();
 
-        let processors: Vec<Box<dyn SegmentProcessor>> = vec![
-            Box::new(GzipCompressor),
-            Box::new(CaptureProcessor(output_bytes.clone())),
-        ];
+        let processors: Vec<Box<dyn SegmentProcessor>> =
+            vec![Box::new(GzipCompressor), Box::new(capture)];
 
         let mut worker = WorkerLoop::new(
-            config_for(dir.path()),
+            fs_for(dir.path()),
+            default_poll(),
             processors,
             stop,
             metrique_writer::sink::DevNullSink::boxed(),
@@ -1791,10 +2014,10 @@ mod worker_pipeline_tests {
         let seg_path = dir.path().join("trace.0.bin");
         std::fs::write(&seg_path, b"payload").unwrap();
 
-        let segment = sealed::SealedSegment {
+        let segment = sealed::SegmentRef::Disk(sealed::SealedSegment {
             path: seg_path.clone(),
             index: 0,
-        };
+        });
 
         let metrics = SegmentProcessMetrics {
             operation: Operation::ProcessSegment,
@@ -1815,6 +2038,7 @@ mod worker_pipeline_tests {
             payload: Payload::from(b"payload"),
             metadata: HashMap::from([("write_back_extension".into(), ".gz".into())]),
             metrics,
+            accounting: None,
         };
 
         let mut processor = WriteBackProcessor;
@@ -1836,10 +2060,10 @@ mod worker_pipeline_tests {
         let seg_path = dir.path().join("trace.0.bin");
         std::fs::write(&seg_path, b"old").unwrap();
 
-        let segment = sealed::SealedSegment {
+        let segment = sealed::SegmentRef::Disk(sealed::SealedSegment {
             path: seg_path.clone(),
             index: 0,
-        };
+        });
 
         let metrics = SegmentProcessMetrics {
             operation: Operation::ProcessSegment,
@@ -1860,6 +2084,7 @@ mod worker_pipeline_tests {
             payload: Payload::from(b"new"),
             metadata: HashMap::new(),
             metrics,
+            accounting: None,
         };
 
         let mut processor = WriteBackProcessor;
@@ -1885,7 +2110,8 @@ mod worker_pipeline_tests {
             vec![Box::new(GzipCompressor), Box::new(WriteBackProcessor)];
 
         let mut worker = WorkerLoop::new(
-            config_for(dir.path()),
+            fs_for(dir.path()),
+            default_poll(),
             processors,
             stop,
             metrique_writer::sink::DevNullSink::boxed(),
@@ -1950,7 +2176,8 @@ mod worker_pipeline_tests {
         let inspector = Inspector::default();
 
         let mut worker = WorkerLoop::new(
-            config_for(dir.path()),
+            fs_for(dir.path()),
+            default_poll(),
             processors,
             stop,
             inspector.clone().boxed(),
@@ -2010,7 +2237,8 @@ mod worker_pipeline_tests {
         let processors: Vec<Box<dyn SegmentProcessor>> = vec![Box::new(HangingProcessor)];
 
         let mut worker = WorkerLoop::new(
-            config_for(dir.path()),
+            fs_for(dir.path()),
+            default_poll(),
             processors,
             stop.clone(),
             metrique_writer::sink::DevNullSink::boxed(),
@@ -2026,5 +2254,441 @@ mod worker_pipeline_tests {
 
         // The timeout should fire because the processor is hung.
         check!(result.is_err(), "expected timeout, but worker completed");
+    }
+
+    /// Disk `mark_writer_done` alone (no stop-token cancel) drains and exits.
+    /// Symmetric with memory mode: `DiskWriter::finalize` is a complete
+    /// shutdown signal across both backends.
+    #[tokio::test]
+    async fn disk_worker_run_drains_on_writer_done() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("trace.0.bin"), b"seg0").unwrap();
+        std::fs::write(dir.path().join("trace.1.bin"), b"seg1").unwrap();
+
+        let processed = Arc::new(AtomicUsize::new(0));
+
+        struct CountingProcessor(Arc<AtomicUsize>);
+        impl SegmentProcessor for CountingProcessor {
+            fn name(&self) -> &'static str {
+                "Counting"
+            }
+            fn process(
+                &mut self,
+                data: SegmentData,
+            ) -> Pin<Box<dyn Future<Output = Result<SegmentData, ProcessError>> + Send + '_>>
+            {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                if let Some(p) = data.segment.disk_path() {
+                    let _ = std::fs::remove_file(p);
+                }
+                Box::pin(async { Ok(data) })
+            }
+        }
+
+        let fs = fs_for(dir.path());
+        // Stop token is never cancelled; shutdown rides writer_done only.
+        let stop = tokio_util::sync::CancellationToken::new();
+        let mut worker = WorkerLoop::new(
+            Arc::clone(&fs),
+            Duration::from_millis(10),
+            vec![Box::new(CountingProcessor(processed.clone()))],
+            stop,
+            metrique_writer::sink::DevNullSink::boxed(),
+        );
+
+        fs.mark_writer_done();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), worker.run()).await;
+        check!(result.is_ok(), "worker did not exit on writer_done alone");
+        check!(processed.load(Ordering::SeqCst) == 2);
+    }
+
+    /// `in_flight_bytes` follows payload growth (symbolize) and shrinkage
+    /// (gzip), not just the pop-time size.
+    #[tokio::test]
+    async fn mem_worker_adjusts_in_flight_bytes_across_stages() {
+        use std::io::Write;
+        use std::sync::Mutex;
+        use std::sync::atomic::Ordering;
+
+        struct Mutator;
+        impl SegmentProcessor for Mutator {
+            fn name(&self) -> &'static str {
+                "Mutator"
+            }
+            fn process(
+                &mut self,
+                mut data: SegmentData,
+            ) -> Pin<Box<dyn Future<Output = Result<SegmentData, ProcessError>> + Send + '_>>
+            {
+                let index = data.segment().index();
+                Box::pin(async move {
+                    if index == 0 {
+                        let mut p = data.take_payload();
+                        p.push(bytes::Bytes::from(vec![0u8; 100]));
+                        data.set_payload(p);
+                    } else {
+                        data.set_payload(bytes::Bytes::from(vec![0u8; 5]));
+                    }
+                    Ok(data)
+                })
+            }
+        }
+
+        /// Reads `in_flight_bytes` so we can assert what the worker's
+        /// `adjust` set after `Mutator` returned.
+        struct Probe {
+            samples: Arc<Mutex<Vec<(u32, u64)>>>,
+        }
+        impl SegmentProcessor for Probe {
+            fn name(&self) -> &'static str {
+                "Probe"
+            }
+            fn process(
+                &mut self,
+                data: SegmentData,
+            ) -> Pin<Box<dyn Future<Output = Result<SegmentData, ProcessError>> + Send + '_>>
+            {
+                let index = data.segment().index();
+                let atomic = Arc::clone(
+                    &data
+                        .accounting
+                        .as_ref()
+                        .expect("memory segments should carry accounting")
+                        .in_flight_bytes,
+                );
+                let samples = Arc::clone(&self.samples);
+                Box::pin(async move {
+                    samples
+                        .lock()
+                        .expect("samples mutex should not be poisoned")
+                        .push((index, atomic.load(Ordering::Acquire)));
+                    Ok(data)
+                })
+            }
+        }
+
+        let fs = Fs::new_in_memory(64 * 1024, 1024).expect("memory fs should build");
+        for i in 0..2u32 {
+            let mut h = fs
+                .create_segment(Path::new("x"))
+                .expect("memory fs should create a handle");
+            h.write_all(&[0u8; 50])
+                .expect("write into memory handle should succeed");
+            fs.seal(h, Path::new("x"), i)
+                .expect("sealing into memory ring should succeed");
+        }
+        fs.mark_writer_done();
+
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let stop = tokio_util::sync::CancellationToken::new();
+        let mut worker = WorkerLoop::new(
+            Arc::clone(&fs),
+            Duration::from_millis(1),
+            vec![
+                Box::new(Mutator),
+                Box::new(Probe {
+                    samples: Arc::clone(&samples),
+                }),
+            ],
+            stop,
+            metrique_writer::sink::DevNullSink::boxed(),
+        );
+        tokio::time::timeout(Duration::from_secs(5), worker.run())
+            .await
+            .expect("worker exited");
+
+        let samples = samples
+            .lock()
+            .expect("samples mutex should not be poisoned")
+            .clone();
+        check!(samples == vec![(0, 150), (1, 5)]);
+        let snap = fs.take_files();
+        check!(snap.in_flight_bytes == 0);
+        check!(snap.in_flight_segments == 0);
+    }
+
+    #[test]
+    fn mem_take_files_reports_in_flight_bytes_peak() {
+        use std::io::Write;
+
+        let fs = Fs::new_in_memory(64 * 1024, 1024).unwrap();
+        let mut h = fs.create_segment(Path::new("x")).unwrap();
+        h.write_all(&[0u8; 50]).unwrap();
+        fs.seal(h, Path::new("x"), 0).unwrap();
+
+        // Cycle 1: pop. Peak snapshot reads 0 (nothing happened before).
+        // Inside the same call, the pop seeds the channel peak at 50.
+        let mut snap = fs.take_files();
+        check!(snap.segments.len() == 1);
+        check!(snap.in_flight_bytes == 50);
+        check!(snap.in_flight_bytes_peak == Some(0));
+
+        let taken = snap.segments.remove(0);
+        let (_seg, payload, accounting) = taken.load().unwrap();
+        let mut acct = accounting.expect("memory segment carries accounting");
+        // Verify the in-cycle adjust path moves the peak.
+        let _ = payload;
+        acct.adjust(200);
+        acct.adjust(10);
+        drop(acct);
+
+        // Cycle 2: empty pop. Returned peak is the previous cycle's high.
+        let snap = fs.take_files();
+        check!(snap.segments.is_empty());
+        check!(snap.in_flight_bytes == 0);
+        check!(
+            snap.in_flight_bytes_peak == Some(200),
+            "peak should capture mid-cycle high; got {:?}",
+            snap.in_flight_bytes_peak
+        );
+
+        // Cycle 3: peak has been consumed
+        let snap = fs.take_files();
+        check!(snap.in_flight_bytes_peak == Some(0));
+    }
+
+    /// Multi-threaded race test for memory mode: producer seals segments and
+    /// marks writer_done while the worker may be parked in `wait_for_more`.
+    /// Ensures `run()` drains all segments and exits (no missed wakeup hang).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mem_worker_run_drains_late_push_no_loss() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const ITERS: usize = 30;
+        const SEGMENTS: u32 = 8;
+
+        struct CountingProcessor(Arc<AtomicUsize>);
+        impl SegmentProcessor for CountingProcessor {
+            fn name(&self) -> &'static str {
+                "Counting"
+            }
+            fn process(
+                &mut self,
+                data: SegmentData,
+            ) -> Pin<Box<dyn Future<Output = Result<SegmentData, ProcessError>> + Send + '_>>
+            {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(data) })
+            }
+        }
+
+        for iter in 0..ITERS {
+            let fs = Fs::new_in_memory(64 * 1024, 1024).unwrap();
+            let processed = Arc::new(AtomicUsize::new(0));
+            let stop = tokio_util::sync::CancellationToken::new();
+
+            let mut worker = WorkerLoop::new(
+                Arc::clone(&fs),
+                Duration::from_millis(1),
+                vec![Box::new(CountingProcessor(processed.clone()))],
+                stop,
+                metrique_writer::sink::DevNullSink::boxed(),
+            );
+            let worker_task = tokio::spawn(async move { worker.run().await });
+
+            // Let the worker reach wait_for_more on an empty ring so the
+            // seals below race the wakeup/writer_done window.
+            tokio::task::yield_now().await;
+
+            let producer_fs = Arc::clone(&fs);
+            let producer = tokio::spawn(async move {
+                for i in 0..SEGMENTS {
+                    let mut h = producer_fs.create_segment(Path::new("x")).unwrap();
+                    h.write_all(b"event-bytes").unwrap();
+                    producer_fs.seal(h, Path::new("x"), i).unwrap();
+                }
+                producer_fs.mark_writer_done();
+            });
+
+            producer.await.unwrap();
+            let joined = tokio::time::timeout(Duration::from_secs(5), worker_task).await;
+            check!(
+                joined.is_ok(),
+                "iter {iter}: worker stranded (lost wakeup or missed writer_done)"
+            );
+            joined.unwrap().unwrap();
+
+            check!(
+                processed.load(Ordering::SeqCst) == SEGMENTS as usize,
+                "iter {iter}: expected {SEGMENTS} segments, got {}",
+                processed.load(Ordering::SeqCst)
+            );
+        }
+    }
+
+    /// N<budget retryable failures followed by success: segment delivers,
+    /// in-flight accounting drains.
+    #[tokio::test(start_paused = true)]
+    async fn mem_worker_retries_retryable_within_budget() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct Flaky {
+            fail_count: u32,
+            attempts: Arc<AtomicU32>,
+        }
+        impl SegmentProcessor for Flaky {
+            fn name(&self) -> &'static str {
+                "Flaky"
+            }
+            fn process(
+                &mut self,
+                data: SegmentData,
+            ) -> Pin<Box<dyn Future<Output = Result<SegmentData, ProcessError>> + Send + '_>>
+            {
+                let n = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                let fail_count = self.fail_count;
+                Box::pin(async move {
+                    if n <= fail_count {
+                        Err(ProcessError {
+                            data,
+                            kind: ProcessErrorKind::Transfer {
+                                source: Box::from("transient"),
+                                retryable: true,
+                            },
+                        })
+                    } else {
+                        Ok(data)
+                    }
+                })
+            }
+        }
+
+        let fs = Fs::new_in_memory(64 * 1024, 1024).unwrap();
+        let mut h = fs.create_segment(Path::new("x")).unwrap();
+        h.write_all(&[0u8; 50]).unwrap();
+        fs.seal(h, Path::new("x"), 0).unwrap();
+        fs.mark_writer_done();
+
+        let attempts = Arc::new(AtomicU32::new(0));
+        let stop = tokio_util::sync::CancellationToken::new();
+        let mut worker = WorkerLoop::new(
+            Arc::clone(&fs),
+            Duration::from_millis(1),
+            vec![Box::new(Flaky {
+                fail_count: 2,
+                attempts: Arc::clone(&attempts),
+            })],
+            stop,
+            metrique_writer::sink::DevNullSink::boxed(),
+        );
+        worker.run().await;
+        check!(attempts.load(Ordering::SeqCst) == 3, "2 fails + 1 success");
+        let snap = fs.take_files();
+        check!(snap.in_flight_bytes == 0);
+        check!(snap.in_flight_segments == 0);
+    }
+
+    /// Always-fail retryable: exactly `MEMORY_RETRY_BUDGET + 1` attempts,
+    /// then segment is dropped and accounting drains.
+    #[tokio::test(start_paused = true)]
+    async fn mem_worker_drops_after_retry_budget_exhausted() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct AlwaysFails {
+            attempts: Arc<AtomicU32>,
+        }
+        impl SegmentProcessor for AlwaysFails {
+            fn name(&self) -> &'static str {
+                "AlwaysFails"
+            }
+            fn process(
+                &mut self,
+                data: SegmentData,
+            ) -> Pin<Box<dyn Future<Output = Result<SegmentData, ProcessError>> + Send + '_>>
+            {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    Err(ProcessError {
+                        data,
+                        kind: ProcessErrorKind::Transfer {
+                            source: Box::from("permanent"),
+                            retryable: true,
+                        },
+                    })
+                })
+            }
+        }
+
+        let fs = Fs::new_in_memory(64 * 1024, 1024).unwrap();
+        let mut h = fs.create_segment(Path::new("x")).unwrap();
+        h.write_all(&[0u8; 50]).unwrap();
+        fs.seal(h, Path::new("x"), 0).unwrap();
+        fs.mark_writer_done();
+
+        let attempts = Arc::new(AtomicU32::new(0));
+        let stop = tokio_util::sync::CancellationToken::new();
+        let mut worker = WorkerLoop::new(
+            Arc::clone(&fs),
+            Duration::from_millis(1),
+            vec![Box::new(AlwaysFails {
+                attempts: Arc::clone(&attempts),
+            })],
+            stop,
+            metrique_writer::sink::DevNullSink::boxed(),
+        );
+        worker.run().await;
+        check!(
+            attempts.load(Ordering::SeqCst) == crate::background_task::fs::MEMORY_RETRY_BUDGET + 1,
+            "initial + budget retries",
+        );
+        let snap = fs.take_files();
+        check!(snap.in_flight_bytes == 0);
+        check!(snap.in_flight_segments == 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mem_e2e_real_s3_pipeline_recovers_within_budget() {
+        use std::io::Write;
+        use std::sync::atomic::Ordering;
+
+        let FlakyHarness {
+            uploader,
+            fail_counter,
+            s3_root,
+        } = flaky_s3_harness(2);
+        // > CB initial backoff (1s) so CB reopens between retries. CB
+        // doubles per failure; budget=3 fits 1s+2s within the 15s cap below.
+        let poll_interval = Duration::from_millis(1100);
+
+        let payload = b"segment-payload-bytes";
+        let fs = Fs::new_in_memory(64 * 1024, 1024).unwrap();
+        let mut h = fs.create_segment(Path::new("x")).unwrap();
+        h.write_all(payload).unwrap();
+        fs.seal(h, Path::new("x"), 0).unwrap();
+        fs.mark_writer_done();
+
+        let stop = tokio_util::sync::CancellationToken::new();
+        let mut worker = WorkerLoop::new(
+            Arc::clone(&fs),
+            poll_interval,
+            vec![Box::new(S3PipelineUploader::from_ready(
+                uploader,
+                connection::CircuitBreaker::new(),
+            ))],
+            stop,
+            metrique_writer::sink::DevNullSink::boxed(),
+        );
+        tokio::time::timeout(Duration::from_secs(15), worker.run())
+            .await
+            .expect("worker hung");
+
+        check!(
+            fail_counter.load(Ordering::SeqCst) == 0,
+            "all injected failures consumed",
+        );
+        let uploaded = read_only_object(s3_root.path());
+        check!(
+            uploaded == payload,
+            "uploaded body must match seal'd bytes (snapshot survived retries)",
+        );
+        let snap = fs.take_files();
+        check!(snap.in_flight_bytes == 0);
+        check!(snap.in_flight_segments == 0);
     }
 }

@@ -13,6 +13,7 @@ pub(crate) enum Operation {
     Flush,
     ProcessSegment,
     TlDrain,
+    WorkerCycle,
 }
 
 /// Metrics emitted by the flush thread each cycle.
@@ -34,6 +35,35 @@ pub(crate) struct FlushMetrics {
 
     /// True when finalizing (sealing) the segment failed during the final flush.
     pub finalize_failed: bool,
+}
+
+/// Metrics emitted once per worker cycle
+#[metrics(rename_all = "PascalCase")]
+#[derive(Debug)]
+pub(crate) struct WorkerCycleMetrics {
+    pub operation: Operation,
+    /// Segments waiting in the memory ring after this cycle's pop.
+    /// `None` on disk.
+    pub memory_queued_segments: Option<u64>,
+    /// Encoded bytes resident in the memory ring after this cycle's pop.
+    /// `None` on disk.
+    #[metrics(unit = metrique::unit::Byte)]
+    pub memory_queued_bytes: Option<u64>,
+    /// Segments claimed by the worker and not yet released.
+    pub in_flight_segments: u64,
+    /// Current bytes held by in-flight `SegmentData` at sample time.
+    /// Reflects processor mutations via `SegmentAccounting::adjust`.
+    #[metrics(unit = metrique::unit::Byte)]
+    pub in_flight_bytes: u64,
+    /// High-water of `in_flight_bytes` observed across the event window.
+    /// `None` on disk (no per-stage mutation tracking).
+    #[metrics(unit = metrique::unit::Byte)]
+    pub memory_peak_in_flight_bytes: Option<u64>,
+    /// Segments evicted during this event's window (disk: `evict_oldest`,
+    /// memory: ring overflow).
+    pub segments_evicted: u64,
+    /// Segments handed into the pipeline during this cycle.
+    pub segments_dispatched: u64,
 }
 
 /// Per-cycle counters produced by the intrusive thread-local buffer

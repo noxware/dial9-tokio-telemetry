@@ -320,7 +320,7 @@ mod tests {
     use crate::telemetry::buffer;
     use crate::telemetry::collector::CentralCollector;
     #[cfg(feature = "cpu-profiling")]
-    use crate::telemetry::writer::RotatingWriter;
+    use crate::telemetry::writer::DiskWriter;
     use std::panic::Location;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize};
@@ -548,7 +548,7 @@ mod tests {
         let location_a = loc_a();
         let location_b = loc_b();
 
-        let writer = crate::telemetry::writer::RotatingWriter::builder()
+        let writer = crate::telemetry::writer::DiskWriter::builder()
             .base_path(&base)
             .max_file_size(100)
             .max_total_size(100_000)
@@ -751,7 +751,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let trace_path = dir.path().join("trace.bin");
 
-        let writer = crate::telemetry::writer::RotatingWriter::builder()
+        let writer = crate::telemetry::writer::DiskWriter::builder()
             .base_path(&trace_path)
             .max_file_size(1024 * 1024)
             .max_total_size(10 * 1024 * 1024)
@@ -906,7 +906,7 @@ mod tests {
         use crate::telemetry::events::{CpuSampleData, CpuSampleSource, TelemetryEvent};
         use crate::telemetry::format::WorkerId;
         use crate::telemetry::task_metadata::TaskId;
-        use crate::telemetry::writer::RotatingWriter;
+        use crate::telemetry::writer::DiskWriter;
         use proptest::prelude::*;
 
         /// Encode a single event into a batch and write it through the writer.
@@ -1080,7 +1080,7 @@ mod tests {
                 let dir = tempfile::TempDir::new().unwrap();
                 let base = dir.path().join("trace");
 
-                let writer = RotatingWriter::builder()
+                let writer = DiskWriter::builder()
                     .base_path(&base)
                     .max_file_size(max_file_size)
                     .max_total_size(1_000_000)
@@ -1518,7 +1518,7 @@ mod tests {
     #[cfg(feature = "worker-s3")]
     #[test]
     fn with_s3_client_then_with_s3_uploader_preserves_client() {
-        use crate::background_task::s3::S3Config;
+        use crate::{background_task::s3::S3Config, telemetry::Disk};
 
         fn dummy_client() -> aws_sdk_s3::Client {
             let conf = aws_sdk_s3::Config::builder()
@@ -1541,7 +1541,7 @@ mod tests {
 
         // Order A: client set after the uploader — already worked.
         let mut builder = TracedRuntime::builder()
-            .with_s3_uploader(cfg("a"))
+            .with_s3_uploader::<Disk>(cfg("a"))
             .with_s3_client(dummy_client());
         match &mut builder.pipeline {
             PipelineConfig::S3(u) => {
@@ -1556,7 +1556,7 @@ mod tests {
         // Order B: client set first, then a follow-up `with_s3_uploader`. The
         // replacement must carry the previously-bound client across.
         let mut builder = TracedRuntime::builder()
-            .with_s3_uploader(cfg("a"))
+            .with_s3_uploader::<Disk>(cfg("a"))
             .with_s3_client(dummy_client())
             .with_s3_uploader(cfg("b"));
         match &mut builder.pipeline {
@@ -1577,6 +1577,7 @@ mod tests {
     /// `with_segment_metadata`.
     mod segment_metadata_routing {
         use super::*;
+        use crate::telemetry::writer::Disk;
 
         fn entries<P, M>(builder: &TracedRuntimeBuilder<P, M>) -> &[(String, String)] {
             &builder.segment_metadata
@@ -1595,7 +1596,7 @@ mod tests {
         #[cfg(feature = "worker-s3")]
         #[test]
         fn s3_preset_populates_from_config() {
-            let builder = TracedRuntime::builder().with_s3_uploader(s3_cfg());
+            let builder = TracedRuntime::builder().with_s3_uploader::<Disk>(s3_cfg());
             let m: std::collections::HashMap<&str, &str> = entries(&builder)
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -1615,7 +1616,7 @@ mod tests {
                 .boot_id("other-boot")
                 .build();
             let builder = TracedRuntime::builder()
-                .with_s3_uploader(s3_cfg())
+                .with_s3_uploader::<Disk>(s3_cfg())
                 .with_s3_uploader(cfg2);
             let m: std::collections::HashMap<&str, &str> = entries(&builder)
                 .iter()
@@ -1676,7 +1677,7 @@ mod tests {
         fn with_segment_metadata_after_s3_overrides_preset() {
             let custom = vec![("env".to_string(), "prod".to_string())];
             let builder = TracedRuntime::builder()
-                .with_s3_uploader(s3_cfg())
+                .with_s3_uploader::<Disk>(s3_cfg())
                 .with_segment_metadata(custom.clone());
             assert_eq!(entries(&builder), custom.as_slice());
         }
@@ -1688,7 +1689,7 @@ mod tests {
         fn s3_after_with_segment_metadata_overwrites() {
             let builder = TracedRuntime::builder()
                 .with_segment_metadata(vec![("env".into(), "prod".into())])
-                .with_s3_uploader(s3_cfg());
+                .with_s3_uploader::<Disk>(s3_cfg());
             let m: std::collections::HashMap<&str, &str> = entries(&builder)
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -1736,7 +1737,7 @@ mod tests {
         let trace_path = dir.path().join("trace.bin");
 
         // Small max_file_size to force rotation quickly.
-        let writer = RotatingWriter::new(&trace_path, 4 * 1024, 10 * 1024 * 1024).unwrap();
+        let writer = DiskWriter::new(&trace_path, 4 * 1024, 10 * 1024 * 1024).unwrap();
 
         let guard = TelemetryCore::builder()
             .writer(writer)

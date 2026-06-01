@@ -1,11 +1,11 @@
 //! Sealed-file detection for the worker pipeline.
 //!
-//! Finds `.bin` files produced by `RotatingWriter` rename-on-seal,
+//! Finds `.bin` files produced by `DiskWriter` rename-on-seal,
 //! ignoring `.active` files that are still being written.
 
 use std::path::{Path, PathBuf};
 
-/// A sealed trace segment ready for processing.
+/// A sealed trace segment ready for processing (disk-backed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealedSegment {
     pub(crate) path: PathBuf,
@@ -21,6 +21,61 @@ impl SealedSegment {
     /// Segment index (e.g. `3` for `trace.3.bin`).
     pub fn index(&self) -> u32 {
         self.index
+    }
+}
+
+/// A sealed trace segment backed by in-process memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemorySegment {
+    pub(crate) index: u32,
+    pub(crate) size: u64,
+}
+
+impl MemorySegment {
+    /// Segment index.
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+
+    /// Encoded segment size in bytes.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+/// A sealed trace segment, either disk-backed or memory-backed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SegmentRef {
+    /// On-disk segment file
+    Disk(SealedSegment),
+    /// In-process segment
+    Memory(MemorySegment),
+}
+
+impl SegmentRef {
+    /// Segment index.
+    pub fn index(&self) -> u32 {
+        match self {
+            SegmentRef::Disk(s) => s.index,
+            SegmentRef::Memory(m) => m.index,
+        }
+    }
+
+    /// Returns the on-disk path for disk-backed segments.
+    pub(crate) fn disk_path(&self) -> Option<&Path> {
+        match self {
+            SegmentRef::Disk(s) => Some(&s.path),
+            SegmentRef::Memory(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for SegmentRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SegmentRef::Disk(s) => write!(f, "{}", s.path.display()),
+            SegmentRef::Memory(m) => write!(f, "mem://{}", m.index),
+        }
     }
 }
 
@@ -171,6 +226,31 @@ pub(crate) fn find_sealed_segments(dir: &Path, stem: &str) -> std::io::Result<Ve
     Ok(segments)
 }
 
+/// Trace-segment artifact found in the trace directory: a retained segment
+/// (`.bin` or write-back sibling like `.bin.gz`) or a stale `.bin.active`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SegmentArtifact {
+    Retained { index: u32 },
+    Active,
+}
+
+/// Classify a filename against the `{stem}.{index}.bin*` family.
+pub(crate) fn parse_segment_artifact(file_name: &str, stem: &str) -> Option<SegmentArtifact> {
+    let rest = file_name.strip_prefix(stem)?.strip_prefix('.')?;
+    if let Some(idx) = rest.strip_suffix(".bin.active")
+        && idx.parse::<u32>().is_ok()
+    {
+        return Some(SegmentArtifact::Active);
+    }
+    let (index, suffix) = rest.split_once(".bin")?;
+    if !suffix.is_empty() && !suffix.starts_with('.') {
+        return None;
+    }
+    Some(SegmentArtifact::Retained {
+        index: index.parse().ok()?,
+    })
+}
+
 /// Parse segment index from a filename like `trace.3.bin`.
 /// Returns `None` if the filename doesn't match `{stem}.{index}.bin`.
 fn parse_segment_index(file_name: &str, stem: &str) -> Option<u32> {
@@ -238,14 +318,14 @@ mod tests {
     #[test]
     fn test_parse_segment_timestamp() {
         use crate::telemetry::format::WorkerParkEvent;
-        use crate::telemetry::writer::{RotatingWriter, TraceWriter};
+        use crate::telemetry::writer::{DiskWriter, TraceWriter};
         use dial9_trace_format::encoder::Encoder;
         use tempfile::TempDir;
 
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
 
-        let mut writer = RotatingWriter::single_file(&base).unwrap();
+        let mut writer = DiskWriter::single_file(&base).unwrap();
 
         let mut enc = Encoder::new_to(Vec::new()).unwrap();
         enc.write_infallible(&WorkerParkEvent {
@@ -278,14 +358,14 @@ mod tests {
     #[test]
     fn test_creation_epoch_secs_uses_parsed_timestamp() {
         use crate::telemetry::format::WorkerParkEvent;
-        use crate::telemetry::writer::{RotatingWriter, TraceWriter};
+        use crate::telemetry::writer::{DiskWriter, TraceWriter};
         use dial9_trace_format::encoder::Encoder;
         use tempfile::TempDir;
 
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
 
-        let mut writer = RotatingWriter::single_file(&base).unwrap();
+        let mut writer = DiskWriter::single_file(&base).unwrap();
 
         let mut enc = Encoder::new_to(Vec::new()).unwrap();
         enc.write_infallible(&WorkerParkEvent {
@@ -337,14 +417,14 @@ mod tests {
     #[test]
     fn test_parse_segment_timestamp_no_metadata() {
         use crate::telemetry::format::WorkerParkEvent;
-        use crate::telemetry::writer::{RotatingWriter, TraceWriter};
+        use crate::telemetry::writer::{DiskWriter, TraceWriter};
         use dial9_trace_format::encoder::Encoder;
 
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("trace");
 
         // Don't call set_segment_metadata — writer should still write one automatically
-        let mut writer = RotatingWriter::single_file(&base).unwrap();
+        let mut writer = DiskWriter::single_file(&base).unwrap();
         let mut enc = Encoder::new_to(Vec::new()).unwrap();
         enc.write_infallible(&WorkerParkEvent {
             timestamp_ns: 1_000_000_000,
@@ -426,6 +506,24 @@ mod tests {
             Err(ParseTimestampError::EndOfStream { .. })
                 | Err(ParseTimestampError::NoAnchorInFirst10Events)
         ));
+    }
+
+    #[test]
+    fn parse_segment_artifact_classifies_family() {
+        check!(
+            parse_segment_artifact("trace.0.bin", "trace")
+                == Some(SegmentArtifact::Retained { index: 0 })
+        );
+        check!(
+            parse_segment_artifact("trace.42.bin.gz", "trace")
+                == Some(SegmentArtifact::Retained { index: 42 })
+        );
+        check!(
+            parse_segment_artifact("trace.5.bin.active", "trace") == Some(SegmentArtifact::Active)
+        );
+        check!(parse_segment_artifact("trace.bin", "trace").is_none());
+        check!(parse_segment_artifact("other.0.bin", "trace").is_none());
+        check!(parse_segment_artifact("trace.0.binx", "trace").is_none());
     }
 
     #[test]

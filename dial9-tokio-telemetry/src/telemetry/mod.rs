@@ -37,7 +37,9 @@ pub use recorder::{
 };
 pub use task_dump_config::TaskDumpConfig;
 pub use task_metadata::{TaskId, UNKNOWN_TASK_ID};
-pub use writer::{NullWriter, RotatingWriter, TraceWriter};
+pub use writer::{
+    Disk, DiskWriter, InMemoryWriter, Memory, NullWriter, SegmentWriter, TraceWriter, WriterMode,
+};
 
 /// Record a custom event into the trace.
 ///
