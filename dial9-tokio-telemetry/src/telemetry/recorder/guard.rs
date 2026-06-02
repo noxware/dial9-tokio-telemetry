@@ -151,6 +151,7 @@ impl TelemetryGuard {
             name: name.into(),
             task_tracking: false,
             tokio_instrumentation_enabled: true,
+            custom_metrics_sources: Vec::new(),
             tokio_hooks: super::TokioHooks::default(),
         }
     }
@@ -260,6 +261,7 @@ pub struct TraceRuntimeCoreBuilder<'a> {
     name: String,
     task_tracking: bool,
     tokio_instrumentation_enabled: bool,
+    custom_metrics_sources: Vec<crate::telemetry::custom_metrics::CustomMetricsSource>,
     tokio_hooks: super::TokioHooks,
 }
 
@@ -286,6 +288,27 @@ impl<'a> TraceRuntimeCoreBuilder<'a> {
         F: FnOnce(&mut super::TokioHooks),
     {
         f(&mut self.tokio_hooks);
+        self
+    }
+
+    /// Run a custom metrics callback from dial9's flush thread.
+    ///
+    /// The callback runs during source flush cycles while telemetry is enabled.
+    /// Use [`CustomMetricsConfig::minimum_interval`](crate::telemetry::CustomMetricsConfig::minimum_interval)
+    /// to throttle polling-style callbacks. The default interval is
+    /// [`std::time::Duration::ZERO`], which runs the callback on every source
+    /// flush cycle.
+    pub fn with_custom_metrics<F>(
+        mut self,
+        config: crate::telemetry::CustomMetricsConfig,
+        callback: F,
+    ) -> Self
+    where
+        F: for<'b> FnMut(&mut crate::telemetry::CustomMetricsContext<'b>) + Send + 'static,
+    {
+        self.custom_metrics_sources.push(
+            crate::telemetry::custom_metrics::CustomMetricsSource::new(config, callback),
+        );
         self
     }
 
@@ -316,6 +339,9 @@ impl<'a> TraceRuntimeCoreBuilder<'a> {
 
         if !self.tokio_instrumentation_enabled {
             let runtime = builder.build()?;
+            for source in self.custom_metrics_sources {
+                shared.push_source(Box::new(source));
+            }
             let handle = RuntimeTelemetryHandle {
                 runtime: runtime.handle().clone(),
                 traced: None,
@@ -331,6 +357,9 @@ impl<'a> TraceRuntimeCoreBuilder<'a> {
             self.task_tracking,
             self.tokio_hooks,
         )?;
+        for source in self.custom_metrics_sources {
+            shared.push_source(Box::new(source));
+        }
         let handle = RuntimeTelemetryHandle {
             runtime: runtime.handle().clone(),
             traced: Some(traced),

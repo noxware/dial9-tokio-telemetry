@@ -440,6 +440,37 @@ record_event(
 # }
 ```
 
+### Custom metrics callbacks
+
+You can also register a callback that runs from dial9's flush thread and emits
+custom events. This is useful for draining application-owned queues or taking
+periodic snapshots without passing a [`TelemetryHandle`] through your code:
+
+```rust,no_run
+use dial9_trace_format::TraceEvent;
+use dial9_tokio_telemetry::telemetry::{CustomMetricsConfig, TracedRuntime};
+
+#[derive(TraceEvent)]
+struct CacheMetric {
+    #[traceevent(timestamp)]
+    timestamp_ns: u64,
+    entries: u64,
+}
+
+let (_runtime, _guard) = TracedRuntime::builder()
+    .with_custom_metrics(CustomMetricsConfig::default(), move |ctx| {
+        while let Ok(metric) = rx.try_recv() {
+            ctx.record_event(metric);
+        }
+    })
+    .build_and_start_with_writer(builder, writer)?;
+```
+
+`CustomMetricsConfig::default()` runs the callback every source flush cycle
+while telemetry is enabled, which fits drain-style callbacks. For polling-style
+callbacks, configure `minimum_interval(...)` to limit how often dial9 invokes
+the callback.
+
 ### Custom Runtime Hooks
 
 dial9 installs callbacks on all 8 Tokio runtime hooks to collect telemetry. If you need to run your own logic alongside dial9's instrumentation, use `with_tokio_hooks`:
