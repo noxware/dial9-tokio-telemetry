@@ -60,7 +60,7 @@ pub struct TracedRuntimeBuilder<P = NoTracePath, M = PipelineUnset, Mode: Writer
     #[cfg(feature = "cpu-profiling")]
     pub(super) sched_event_config: Option<crate::telemetry::cpu_profile::SchedEventConfig>,
     pub(super) process_resource_usage_config: Option<crate::telemetry::ProcessResourceUsageConfig>,
-    pub(super) custom_metrics_sources: Vec<crate::telemetry::custom_metrics::CustomMetricsSource>,
+    pub(super) custom_event_sources: Vec<crate::telemetry::custom_events::CustomEventsSource>,
     pub(super) pipeline: PipelineConfig,
     /// Static segment metadata to inject into every rotated segment's
     /// header. The S3 preset populates this from `S3Config::as_metadata`
@@ -180,23 +180,24 @@ impl<P, M, Mode: WriterMode> TracedRuntimeBuilder<P, M, Mode> {
         self
     }
 
-    /// Run a custom metrics callback from dial9's flush thread.
+    /// Register a custom event callback.
     ///
-    /// The callback runs during source flush cycles while telemetry is enabled.
-    /// Use [`CustomMetricsConfig::minimum_interval`](crate::telemetry::CustomMetricsConfig::minimum_interval)
+    /// The callback runs during flush cycles while telemetry is enabled.
+    /// Use [`CustomEventsConfig::minimum_interval`](crate::telemetry::CustomEventsConfig::minimum_interval)
     /// to throttle polling-style callbacks. The default interval is
-    /// [`Duration::ZERO`], which runs the callback on every source flush cycle.
-    pub fn with_custom_metrics<F>(
+    /// [`Duration::ZERO`], which runs the callback on every flush cycle.
+    pub fn with_custom_events<F>(
         mut self,
-        config: crate::telemetry::CustomMetricsConfig,
+        config: crate::telemetry::CustomEventsConfig,
         callback: F,
     ) -> Self
     where
-        F: for<'a> FnMut(&mut crate::telemetry::CustomMetricsContext<'a>) + Send + 'static,
+        F: for<'a> FnMut(&mut crate::telemetry::CustomEventsContext<'a>) + Send + 'static,
     {
-        self.custom_metrics_sources.push(
-            crate::telemetry::custom_metrics::CustomMetricsSource::new(config, callback),
-        );
+        self.custom_event_sources
+            .push(crate::telemetry::custom_events::CustomEventsSource::new(
+                config, callback,
+            ));
         self
     }
 
@@ -247,11 +248,11 @@ impl<P, M, Mode: WriterMode> TracedRuntimeBuilder<P, M, Mode> {
             // telemetry hooks so attaching still works gracefully.
             return builder.build();
         };
-        let custom_metrics_sources = self.custom_metrics_sources;
+        let custom_event_sources = self.custom_event_sources;
 
         if !self.tokio_instrumentation_enabled {
             let runtime = builder.build()?;
-            for source in custom_metrics_sources {
+            for source in custom_event_sources {
                 shared.push_source(Box::new(source));
             }
             return Ok(runtime);
@@ -265,7 +266,7 @@ impl<P, M, Mode: WriterMode> TracedRuntimeBuilder<P, M, Mode> {
             self.task_tracking_enabled,
             self.tokio_hooks,
         )?;
-        for source in custom_metrics_sources {
+        for source in custom_event_sources {
             shared.push_source(Box::new(source));
         }
         Ok(runtime)
@@ -286,7 +287,7 @@ impl<P, M, Mode: WriterMode> TracedRuntimeBuilder<P, M, Mode> {
             #[cfg(feature = "cpu-profiling")]
             sched_event_config: self.sched_event_config,
             process_resource_usage_config: self.process_resource_usage_config,
-            custom_metrics_sources: self.custom_metrics_sources,
+            custom_event_sources: self.custom_event_sources,
             pipeline: self.pipeline,
             segment_metadata: self.segment_metadata,
             worker_poll_interval: self.worker_poll_interval,
@@ -539,7 +540,7 @@ impl<M, Mode: WriterMode> TracedRuntimeBuilder<HasTracePath, M, Mode> {
             return TracedRuntime::build_disabled(builder);
         }
 
-        let custom_metrics_sources = self.custom_metrics_sources;
+        let custom_event_sources = self.custom_event_sources;
 
         let processors = assemble_processors(
             #[cfg(feature = "cpu-profiling")]
@@ -566,7 +567,7 @@ impl<M, Mode: WriterMode> TracedRuntimeBuilder<HasTracePath, M, Mode> {
         let guard = core_builder.build()?;
 
         if let Some(shared) = guard.shared() {
-            for source in custom_metrics_sources {
+            for source in custom_event_sources {
                 shared.push_source(Box::new(source));
             }
         }
@@ -959,7 +960,7 @@ impl TracedRuntime {
             #[cfg(feature = "cpu-profiling")]
             sched_event_config: None,
             process_resource_usage_config: None,
-            custom_metrics_sources: Vec::new(),
+            custom_event_sources: Vec::new(),
             pipeline: PipelineConfig::Unset,
             segment_metadata: Vec::new(),
             worker_poll_interval: None,
