@@ -186,6 +186,9 @@ impl<P, M, Mode: WriterMode> TracedRuntimeBuilder<P, M, Mode> {
     /// Use [`CustomEventsConfig::minimum_interval`](crate::telemetry::CustomEventsConfig::minimum_interval)
     /// to throttle polling-style callbacks. The default interval is
     /// [`Duration::ZERO`], which runs the callback on every flush cycle.
+    ///
+    /// This method can be called multiple times to configure multiple
+    /// callbacks.
     pub fn with_custom_events<F>(
         mut self,
         config: crate::telemetry::CustomEventsConfig,

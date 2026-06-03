@@ -298,6 +298,9 @@ impl<'a> TraceRuntimeCoreBuilder<'a> {
     /// to throttle polling-style callbacks. The default interval is
     /// [`std::time::Duration::ZERO`], which runs the callback on every flush
     /// cycle.
+    ///
+    /// This method can be called multiple times to configure multiple
+    /// callbacks.
     pub fn with_custom_events<F>(
         mut self,
         config: crate::telemetry::CustomEventsConfig,
