@@ -60,6 +60,7 @@ pub struct TracedRuntimeBuilder<P = NoTracePath, M = PipelineUnset, Mode: Writer
     #[cfg(feature = "cpu-profiling")]
     pub(super) sched_event_config: Option<crate::telemetry::cpu_profile::SchedEventConfig>,
     pub(super) process_resource_usage_config: Option<crate::telemetry::ProcessResourceUsageConfig>,
+    pub(super) socket_accept_queues_config: Option<crate::telemetry::SocketAcceptQueuesConfig>,
     pub(super) custom_event_sources: Vec<crate::telemetry::custom_events::CustomEventsSource>,
     pub(super) pipeline: PipelineConfig,
     /// Static segment metadata to inject into every rotated segment's
@@ -180,6 +181,15 @@ impl<P, M, Mode: WriterMode> TracedRuntimeBuilder<P, M, Mode> {
         self
     }
 
+    /// Enable TCP listen socket accept queue sampling (Linux only).
+    pub fn with_socket_accept_queues(
+        mut self,
+        config: crate::telemetry::SocketAcceptQueuesConfig,
+    ) -> Self {
+        self.socket_accept_queues_config = Some(config);
+        self
+    }
+
     /// Register a custom event callback.
     ///
     /// The callback runs during flush cycles while telemetry is enabled.
@@ -290,6 +300,7 @@ impl<P, M, Mode: WriterMode> TracedRuntimeBuilder<P, M, Mode> {
             #[cfg(feature = "cpu-profiling")]
             sched_event_config: self.sched_event_config,
             process_resource_usage_config: self.process_resource_usage_config,
+            socket_accept_queues_config: self.socket_accept_queues_config,
             custom_event_sources: self.custom_event_sources,
             pipeline: self.pipeline,
             segment_metadata: self.segment_metadata,
@@ -557,6 +568,7 @@ impl<M, Mode: WriterMode> TracedRuntimeBuilder<HasTracePath, M, Mode> {
             .maybe_trace_path(self.trace_path)
             .maybe_task_dump_config(self.task_dump_config)
             .maybe_process_resource_usage(self.process_resource_usage_config)
+            .maybe_socket_accept_queues(self.socket_accept_queues_config)
             .maybe_worker_poll_interval(self.worker_poll_interval)
             .maybe_worker_metrics_sink(self.worker_metrics_sink)
             .processors(processors)
@@ -718,6 +730,8 @@ impl TelemetryCore {
         sched_events: Option<crate::telemetry::cpu_profile::SchedEventConfig>,
         /// Enable process resource usage sampled from `getrusage(RUSAGE_SELF)`.
         process_resource_usage: Option<crate::telemetry::ProcessResourceUsageConfig>,
+        /// Enable TCP listen socket accept queue sampling (Linux only).
+        socket_accept_queues: Option<crate::telemetry::SocketAcceptQueuesConfig>,
         /// How often the background worker polls for sealed segments.
         worker_poll_interval: Option<Duration>,
         /// Metrics sink for the flush/worker threads.
@@ -786,6 +800,20 @@ impl TelemetryCore {
                 let _ = config;
                 tracing::warn!(
                     "process resource usage enabled but getrusage is not available on this platform"
+                );
+            }
+        }
+
+        if let Some(config) = socket_accept_queues {
+            #[cfg(target_os = "linux")]
+            shared.push_source(Box::new(
+                crate::telemetry::socket_accept_queues::SocketAcceptQueuesSource::new(config),
+            ));
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = config;
+                tracing::warn!(
+                    "socket accept queue sampling enabled but sock_diag is not available on this platform"
                 );
             }
         }
@@ -963,6 +991,7 @@ impl TracedRuntime {
             #[cfg(feature = "cpu-profiling")]
             sched_event_config: None,
             process_resource_usage_config: None,
+            socket_accept_queues_config: None,
             custom_event_sources: Vec::new(),
             pipeline: PipelineConfig::Unset,
             segment_metadata: Vec::new(),

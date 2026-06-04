@@ -309,6 +309,28 @@ pub struct ProcessResourceUsageEvent {
     pub involuntary_context_switches: u64,
 }
 
+/// TCP listen socket accept queue sample.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[non_exhaustive]
+pub struct SocketAcceptQueueEvent {
+    /// Timestamp in nanoseconds (monotonic).
+    pub timestamp_ns: u64,
+    /// Address family, e.g. `AF_INET` or `AF_INET6`.
+    pub address_family: u8,
+    /// IP protocol, currently `IPPROTO_TCP`.
+    pub protocol: u8,
+    /// Local listen address without the port.
+    pub local_addr: String,
+    /// Local listen port.
+    pub local_port: u16,
+    /// Kernel socket inode.
+    pub socket_inode: u64,
+    /// Completed connections waiting for `accept()`.
+    pub pending_connections: u64,
+    /// Listen backlog limit reported by the kernel.
+    pub backlog_limit: u64,
+}
+
 /// An application-defined custom event not recognized as a built-in type.
 ///
 /// Fields are resolved from the string/stack pools at parse time so they
@@ -399,6 +421,8 @@ pub enum Dial9Event {
     FreeEvent(FreeEvent),
     /// Process resource usage.
     ProcessResourceUsageEvent(ProcessResourceUsageEvent),
+    /// TCP listen socket accept queue sample.
+    SocketAcceptQueueEvent(SocketAcceptQueueEvent),
     /// An application-defined custom event. Produced by
     /// [`TraceReader`](crate::telemetry::analysis::TraceReader) for unknown
     /// event types. Not populated by direct serde deserialization (use
@@ -573,6 +597,19 @@ mod tests {
         })
         .unwrap();
 
+        // 16. SocketAcceptQueueEvent
+        enc.write(&format::SocketAcceptQueueEvent {
+            timestamp_ns: 15_000_000,
+            address_family: libc::AF_INET as u8,
+            protocol: libc::IPPROTO_TCP as u8,
+            local_addr: "127.0.0.1".to_string(),
+            local_port: 8080,
+            socket_inode: 123_456,
+            pending_connections: 2,
+            backlog_limit: 128,
+        })
+        .unwrap();
+
         // ── Decode ──────────────────────────────────────────────────────────
         let bytes = enc.finish();
         let mut dec = Decoder::new(&bytes).expect("synthetic trace should have a valid header");
@@ -585,7 +622,7 @@ mod tests {
         })
         .expect("decode");
 
-        assert_eq!(events.len(), 15);
+        assert_eq!(events.len(), 16);
 
         // 1. PollStartEvent
         let Dial9Event::PollStartEvent(ref e) = events[0] else {
@@ -727,6 +764,19 @@ mod tests {
         assert_eq!(e.block_output_ops, 3);
         assert_eq!(e.voluntary_context_switches, 4);
         assert_eq!(e.involuntary_context_switches, 5);
+
+        // 16. SocketAcceptQueueEvent
+        let Dial9Event::SocketAcceptQueueEvent(ref e) = events[15] else {
+            panic!("expected SocketAcceptQueueEvent, got {:?}", events[15]);
+        };
+        assert_eq!(e.timestamp_ns, 15_000_000);
+        assert_eq!(e.address_family, libc::AF_INET as u8);
+        assert_eq!(e.protocol, libc::IPPROTO_TCP as u8);
+        assert_eq!(e.local_addr, "127.0.0.1");
+        assert_eq!(e.local_port, 8080);
+        assert_eq!(e.socket_inode, 123_456);
+        assert_eq!(e.pending_connections, 2);
+        assert_eq!(e.backlog_limit, 128);
     }
 
     #[test]

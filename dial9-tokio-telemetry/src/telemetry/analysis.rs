@@ -65,7 +65,7 @@ impl TraceReader {
                 Dial9Event::SegmentMetadataEvent(e) => {
                     segment_metadata = e.entries.clone();
                 }
-                Dial9Event::Other | Dial9Event::ProcessResourceUsageEvent(_) => {
+                Dial9Event::Other => {
                     // Unknown event: deserialize as CustomEvent to get fields.
                     match ev.deserialize::<crate::telemetry::analysis_events::CustomEvent>() {
                         Ok(custom) => {
@@ -196,6 +196,7 @@ fn event_timestamp(ev: &Dial9Event) -> Option<u64> {
         Dial9Event::AllocEvent(e) => Some(e.timestamp_ns),
         Dial9Event::FreeEvent(e) => Some(e.timestamp_ns),
         Dial9Event::ProcessResourceUsageEvent(e) => Some(e.timestamp_ns),
+        Dial9Event::SocketAcceptQueueEvent(e) => Some(e.timestamp_ns),
         Dial9Event::Custom(e) => e.timestamp_ns,
         Dial9Event::Other => None,
     }
@@ -774,6 +775,50 @@ mod tests {
         assert_eq!(e.worker_id, WorkerId(7));
         assert_eq!(e.local_queue, 3);
         assert_eq!(e.cpu_time_ns, 11);
+    }
+
+    #[test]
+    fn trace_reader_preserves_builtin_resource_events() {
+        let mut enc = Encoder::new();
+        enc.write(&crate::telemetry::format::ProcessResourceUsageEvent {
+            timestamp_ns: 1_000,
+            user_cpu_ns: 10,
+            system_cpu_ns: 20,
+            max_rss_bytes: 30,
+            minor_faults: 40,
+            major_faults: 50,
+            block_input_ops: 60,
+            block_output_ops: 70,
+            voluntary_context_switches: 80,
+            involuntary_context_switches: 90,
+        })
+        .unwrap();
+        enc.write(&crate::telemetry::format::SocketAcceptQueueEvent {
+            timestamp_ns: 2_000,
+            address_family: libc::AF_INET as u8,
+            protocol: libc::IPPROTO_TCP as u8,
+            local_addr: "127.0.0.1".to_string(),
+            local_port: 8080,
+            socket_inode: 123,
+            pending_connections: 2,
+            backlog_limit: 128,
+        })
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trace.bin");
+        std::fs::write(&path, enc.finish()).unwrap();
+
+        let reader = TraceReader::new(path.to_str().unwrap()).unwrap();
+
+        assert!(matches!(
+            reader.all_events.first(),
+            Some(Dial9Event::ProcessResourceUsageEvent(_))
+        ));
+        assert!(matches!(
+            reader.all_events.get(1),
+            Some(Dial9Event::SocketAcceptQueueEvent(_))
+        ));
     }
 
     #[test]
