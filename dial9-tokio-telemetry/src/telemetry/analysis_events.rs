@@ -27,6 +27,53 @@
 //! ```
 
 use serde::Deserialize;
+use serde::de::{SeqAccess, Visitor};
+use std::fmt;
+
+fn deserialize_bytes<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BytesVisitor;
+
+    impl<'de> Visitor<'de> for BytesVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("bytes or a sequence of bytes")
+        }
+
+        fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value.to_vec())
+        }
+
+        fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut bytes = match seq.size_hint() {
+                Some(hint) => Vec::with_capacity(hint),
+                None => Vec::new(),
+            };
+            while let Some(byte) = seq.next_element()? {
+                bytes.push(byte);
+            }
+            Ok(bytes)
+        }
+    }
+
+    deserializer.deserialize_bytes(BytesVisitor)
+}
 
 /// Worker thread identifier.
 ///
@@ -309,6 +356,29 @@ pub struct ProcessResourceUsageEvent {
     pub involuntary_context_switches: u64,
 }
 
+/// TCP listening socket accept queue snapshot.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[non_exhaustive]
+pub struct SocketAcceptQueueEvent {
+    /// Timestamp in nanoseconds (monotonic).
+    pub timestamp_ns: u64,
+    /// Linux socket inode for the listening socket.
+    pub socket_inode: u64,
+    /// IP version of `local_addr`: `4` or `6`.
+    pub ip_version: u8,
+    /// IP protocol number. Currently always TCP (`6`).
+    pub protocol: u8,
+    /// Local address bytes: 4 bytes for IPv4, 16 bytes for IPv6.
+    #[serde(deserialize_with = "deserialize_bytes")]
+    pub local_addr: Vec<u8>,
+    /// Local listening port.
+    pub local_port: u16,
+    /// Completed handshakes waiting to be accepted.
+    pub pending_connections: u32,
+    /// Effective accept backlog limit for this listener.
+    pub backlog_limit: u32,
+}
+
 /// An application-defined custom event not recognized as a built-in type.
 ///
 /// Fields are resolved from the string/stack pools at parse time so they
@@ -399,6 +469,8 @@ pub enum Dial9Event {
     FreeEvent(FreeEvent),
     /// Process resource usage.
     ProcessResourceUsageEvent(ProcessResourceUsageEvent),
+    /// TCP accept queue snapshot.
+    SocketAcceptQueueEvent(SocketAcceptQueueEvent),
     /// An application-defined custom event. Produced by
     /// [`TraceReader`](crate::telemetry::analysis::TraceReader) for unknown
     /// event types. Not populated by direct serde deserialization (use
@@ -573,6 +645,19 @@ mod tests {
         })
         .unwrap();
 
+        // 16. SocketAcceptQueueEvent
+        enc.write(&format::SocketAcceptQueueEvent {
+            timestamp_ns: 15_000_000,
+            socket_inode: 123456,
+            ip_version: 4,
+            protocol: 6,
+            local_addr: vec![127, 0, 0, 1],
+            local_port: 8080,
+            pending_connections: 3,
+            backlog_limit: 128,
+        })
+        .unwrap();
+
         // ── Decode ──────────────────────────────────────────────────────────
         let bytes = enc.finish();
         let mut dec = Decoder::new(&bytes).expect("synthetic trace should have a valid header");
@@ -585,7 +670,7 @@ mod tests {
         })
         .expect("decode");
 
-        assert_eq!(events.len(), 15);
+        assert_eq!(events.len(), 16);
 
         // 1. PollStartEvent
         let Dial9Event::PollStartEvent(ref e) = events[0] else {
@@ -727,6 +812,19 @@ mod tests {
         assert_eq!(e.block_output_ops, 3);
         assert_eq!(e.voluntary_context_switches, 4);
         assert_eq!(e.involuntary_context_switches, 5);
+
+        // 16. SocketAcceptQueueEvent
+        let Dial9Event::SocketAcceptQueueEvent(ref e) = events[15] else {
+            panic!("expected SocketAcceptQueueEvent, got {:?}", events[15]);
+        };
+        assert_eq!(e.timestamp_ns, 15_000_000);
+        assert_eq!(e.socket_inode, 123456);
+        assert_eq!(e.ip_version, 4);
+        assert_eq!(e.protocol, 6);
+        assert_eq!(e.local_addr, vec![127, 0, 0, 1]);
+        assert_eq!(e.local_port, 8080);
+        assert_eq!(e.pending_connections, 3);
+        assert_eq!(e.backlog_limit, 128);
     }
 
     #[test]

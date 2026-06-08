@@ -65,6 +65,11 @@ metrique-timesource = "0.1"
 dial9-macro = { workspace = true }
 shuttle = { version = "0.9.1", optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+netlink-packet-core = "0.7"
+netlink-packet-sock-diag = "0.4.2"
+netlink-sys = "0.8.7"
+
 [features]
 analysis = []
 cpu-profiling = ["dep:dial9-perf-self-profile"]

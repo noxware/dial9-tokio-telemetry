@@ -177,6 +177,30 @@ pub struct ProcessResourceUsageEvent {
     pub involuntary_context_switches: u64,
 }
 
+/// Wire-format event for a TCP listening socket accept queue snapshot.
+#[derive(Debug, TraceEvent)]
+#[traceevent(wire_slot)]
+#[cfg_attr(not(feature = "unstable-events"), non_exhaustive)]
+pub struct SocketAcceptQueueEvent {
+    /// Monotonic timestamp in nanoseconds.
+    #[traceevent(timestamp)]
+    pub timestamp_ns: u64,
+    /// Linux socket inode for the listening socket.
+    pub socket_inode: u64,
+    /// IP version of `local_addr`: `4` or `6`.
+    pub ip_version: u8,
+    /// IP protocol number. Currently always TCP (`6`).
+    pub protocol: u8,
+    /// Local address bytes: 4 bytes for IPv4, 16 bytes for IPv6.
+    pub local_addr: Vec<u8>,
+    /// Local listening port.
+    pub local_port: u16,
+    /// Completed handshakes waiting to be accepted.
+    pub pending_connections: u32,
+    /// Effective accept backlog limit for this listener.
+    pub backlog_limit: u32,
+}
+
 /// Wire-format event for a task spawn.
 #[derive(Debug, TraceEvent)]
 #[traceevent(wire_slot)]
