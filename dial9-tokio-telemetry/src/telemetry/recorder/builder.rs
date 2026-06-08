@@ -60,6 +60,7 @@ pub struct TracedRuntimeBuilder<P = NoTracePath, M = PipelineUnset, Mode: Writer
     #[cfg(feature = "cpu-profiling")]
     pub(super) sched_event_config: Option<crate::telemetry::cpu_profile::SchedEventConfig>,
     pub(super) process_resource_usage_config: Option<crate::telemetry::ProcessResourceUsageConfig>,
+    pub(super) socket_accept_queues_config: Option<crate::telemetry::SocketAcceptQueuesConfig>,
     pub(super) custom_event_sources: Vec<crate::telemetry::custom_events::CustomEventsSource>,
     pub(super) pipeline: PipelineConfig,
     /// Static segment metadata to inject into every rotated segment's
@@ -180,6 +181,15 @@ impl<P, M, Mode: WriterMode> TracedRuntimeBuilder<P, M, Mode> {
         self
     }
 
+    /// Enable TCP listener accept queue snapshots sampled from Linux sock_diag.
+    pub fn with_socket_accept_queues(
+        mut self,
+        config: crate::telemetry::SocketAcceptQueuesConfig,
+    ) -> Self {
+        self.socket_accept_queues_config = Some(config);
+        self
+    }
+
     /// Register a custom event callback.
     ///
     /// The callback runs during flush cycles while telemetry is enabled.
@@ -254,9 +264,13 @@ impl<P, M, Mode: WriterMode> TracedRuntimeBuilder<P, M, Mode> {
             return builder.build();
         };
         let custom_event_sources = self.custom_event_sources;
+        let socket_accept_queues_config = self.socket_accept_queues_config;
 
         if !self.tokio_instrumentation_enabled {
             let runtime = builder.build()?;
+            if let Some(config) = socket_accept_queues_config {
+                push_socket_accept_queues_source(shared, config);
+            }
             for source in custom_event_sources {
                 shared.push_source(Box::new(source));
             }
@@ -272,6 +286,9 @@ impl<P, M, Mode: WriterMode> TracedRuntimeBuilder<P, M, Mode> {
             self.task_tracking_enabled,
             self.tokio_hooks,
         )?;
+        if let Some(config) = socket_accept_queues_config {
+            push_socket_accept_queues_source(shared, config);
+        }
         for source in custom_event_sources {
             shared.push_source(Box::new(source));
         }
@@ -293,6 +310,7 @@ impl<P, M, Mode: WriterMode> TracedRuntimeBuilder<P, M, Mode> {
             #[cfg(feature = "cpu-profiling")]
             sched_event_config: self.sched_event_config,
             process_resource_usage_config: self.process_resource_usage_config,
+            socket_accept_queues_config: self.socket_accept_queues_config,
             custom_event_sources: self.custom_event_sources,
             pipeline: self.pipeline,
             segment_metadata: self.segment_metadata,
@@ -486,6 +504,7 @@ impl<M, Mode: WriterMode> TracedRuntimeBuilder<HasTracePath, M, Mode> {
             .maybe_trace_path(self.trace_path)
             .maybe_task_dump_config(self.task_dump_config)
             .maybe_process_resource_usage(self.process_resource_usage_config)
+            .maybe_socket_accept_queues(self.socket_accept_queues_config)
             .maybe_worker_poll_interval(self.worker_poll_interval)
             .maybe_worker_metrics_sink(self.worker_metrics_sink)
             .processors(processors)
@@ -695,6 +714,22 @@ pub(super) fn assemble_processors(
     processors
 }
 
+fn push_socket_accept_queues_source(
+    shared: &Arc<SharedState>,
+    config: crate::telemetry::SocketAcceptQueuesConfig,
+) {
+    #[cfg(target_os = "linux")]
+    shared.push_source(Box::new(
+        crate::telemetry::socket_accept_queues::SocketAcceptQueuesSource::new(config),
+    ));
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = config;
+        tracing::warn!("socket accept queues enabled but sock_diag is only available on Linux");
+    }
+}
+
 /// Entry point for creating a telemetry session decoupled from any tokio runtime.
 ///
 /// Use [`TelemetryCore::builder()`] to configure the session, then call
@@ -759,6 +794,8 @@ impl TelemetryCore {
         sched_events: Option<crate::telemetry::cpu_profile::SchedEventConfig>,
         /// Enable process resource usage sampled from `getrusage(RUSAGE_SELF)`.
         process_resource_usage: Option<crate::telemetry::ProcessResourceUsageConfig>,
+        /// Enable TCP listener accept queue snapshots sampled from Linux sock_diag.
+        socket_accept_queues: Option<crate::telemetry::SocketAcceptQueuesConfig>,
         /// How often the background worker polls for sealed segments.
         worker_poll_interval: Option<Duration>,
         /// Metrics sink for the flush/worker threads.
@@ -835,6 +872,10 @@ impl TelemetryCore {
                     "process resource usage enabled but getrusage is not available on this platform"
                 );
             }
+        }
+
+        if let Some(config) = socket_accept_queues {
+            push_socket_accept_queues_source(&shared, config);
         }
 
         #[cfg(feature = "cpu-profiling")]
@@ -1014,6 +1055,7 @@ impl TracedRuntime {
             #[cfg(feature = "cpu-profiling")]
             sched_event_config: None,
             process_resource_usage_config: None,
+            socket_accept_queues_config: None,
             custom_event_sources: Vec::new(),
             pipeline: PipelineConfig::Unset,
             segment_metadata: Vec::new(),

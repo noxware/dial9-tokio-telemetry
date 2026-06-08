@@ -19,6 +19,7 @@ pub(crate) mod events;
 pub(crate) mod format;
 pub(crate) mod process_resource_usage;
 pub(crate) mod recorder;
+pub(crate) mod socket_accept_queues;
 pub mod task_dump_config;
 pub(crate) mod task_metadata;
 pub(crate) mod writer;
@@ -28,8 +29,9 @@ pub use buffer::{Encodable, ThreadLocalEncoder};
 pub use custom_events::{CustomEventsConfig, CustomEventsContext};
 pub use events::{CpuSampleSource, clock_monotonic_ns};
 pub use format::{
-    AllocEvent, FreeEvent, PollEndEvent, PollStartEvent, ProcessResourceUsageEvent, TaskSpawnEvent,
-    WakeEventEvent, WorkerId, WorkerParkEvent, WorkerUnparkEvent,
+    AllocEvent, FreeEvent, PollEndEvent, PollStartEvent, ProcessResourceUsageEvent,
+    SocketAcceptQueueEvent, TaskSpawnEvent, WakeEventEvent, WorkerId, WorkerParkEvent,
+    WorkerUnparkEvent,
 };
 pub use process_resource_usage::ProcessResourceUsageConfig;
 pub use recorder::{
@@ -38,6 +40,7 @@ pub use recorder::{
     TelemetryHandle, TelemetryRuntimeError, TokioHooks, TraceRuntimeCoreBuilder, TracedRuntime,
     TracedRuntimeBuilder, current_worker_id, spawn,
 };
+pub use socket_accept_queues::SocketAcceptQueuesConfig;
 pub use task_dump_config::TaskDumpConfig;
 pub use task_metadata::{TaskId, UNKNOWN_TASK_ID};
 pub use writer::{Disk, DiskWriter, InMemoryWriter, Memory, SegmentWriter, WriterMode};

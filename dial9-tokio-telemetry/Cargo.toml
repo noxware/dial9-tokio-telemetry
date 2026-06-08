@@ -150,6 +150,11 @@ dial9-tokio-telemetry = { path = ".", features = [
 ] }
 nix = { version = "0.29", features = ["process"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+netlink-packet-core = "0.7"
+netlink-packet-sock-diag = "0.4.2"
+netlink-sys = "0.8.8"
+
 [[bench]]
 name = "overhead_bench"
 harness = false
