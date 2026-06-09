@@ -261,7 +261,6 @@ const DEFAULT_SCHEDULE_PROFILE_ENABLED: bool =
     cfg!(all(target_os = "linux", feature = "cpu-profiling"));
 const DEFAULT_TASK_DUMP_ENABLED: bool = false;
 const DEFAULT_PROCESS_RESOURCE_USAGE_ENABLED: bool = cfg!(unix);
-const DEFAULT_SOCKET_ACCEPT_QUEUES_ENABLED: bool = false;
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 
@@ -360,7 +359,8 @@ struct ResolvedEnvConfig {
     // None means ProcessResourceUsageConfig::default() owns the sample interval.
     process_resource_usage_sample_interval: Option<Duration>,
 
-    socket_accept_queues_enabled: bool,
+    // Optional source: Some(true) registers it; otherwise leave the builder untouched.
+    socket_accept_queues_enabled: Option<bool>,
 
     // None means SocketAcceptQueuesConfig::default() owns the sample interval.
     socket_accept_queues_sample_interval: Option<Duration>,
@@ -378,7 +378,7 @@ struct RuntimeEnvConfig {
     task_dump_idle_threshold: Option<Duration>,
     process_resource_usage_enabled: bool,
     process_resource_usage_sample_interval: Option<Duration>,
-    socket_accept_queues_enabled: bool,
+    socket_accept_queues_enabled: Option<bool>,
     #[cfg_attr(not(feature = "socket-accept-queues"), allow(dead_code))]
     socket_accept_queues_sample_interval: Option<Duration>,
 }
@@ -468,9 +468,7 @@ fn resolve_env_config(parsed: ParsedEnvConfig) -> ResolvedEnvConfig {
             .process_resource_usage_enabled
             .unwrap_or(DEFAULT_PROCESS_RESOURCE_USAGE_ENABLED),
         process_resource_usage_sample_interval: parsed.process_resource_usage_sample_interval,
-        socket_accept_queues_enabled: parsed
-            .socket_accept_queues_enabled
-            .unwrap_or(DEFAULT_SOCKET_ACCEPT_QUEUES_ENABLED),
+        socket_accept_queues_enabled: parsed.socket_accept_queues_enabled,
         socket_accept_queues_sample_interval: parsed.socket_accept_queues_sample_interval,
     }
 }
@@ -626,7 +624,7 @@ fn apply_runtime_env<M>(
     }
 
     #[cfg(feature = "socket-accept-queues")]
-    if config.socket_accept_queues_enabled {
+    if config.socket_accept_queues_enabled == Some(true) {
         let socket_accept_queues_config = match config.socket_accept_queues_sample_interval {
             Some(interval) => crate::telemetry::SocketAcceptQueuesConfig::builder()
                 .sample_interval(interval)
@@ -637,7 +635,7 @@ fn apply_runtime_env<M>(
     }
 
     #[cfg(not(feature = "socket-accept-queues"))]
-    if config.socket_accept_queues_enabled {
+    if config.socket_accept_queues_enabled == Some(true) {
         warn(format_args!(
             "dial9: socket accept queues requested but `socket-accept-queues` feature is not enabled; ignoring"
         ));
@@ -1305,10 +1303,7 @@ mod tests {
             resolved.process_resource_usage_enabled,
             DEFAULT_PROCESS_RESOURCE_USAGE_ENABLED
         );
-        assert_eq!(
-            resolved.socket_accept_queues_enabled,
-            DEFAULT_SOCKET_ACCEPT_QUEUES_ENABLED
-        );
+        assert_eq!(resolved.socket_accept_queues_enabled, None);
 
         // Optional config/integrations remain absent unless explicitly requested.
         assert_eq!(resolved.runtime_name, None);
