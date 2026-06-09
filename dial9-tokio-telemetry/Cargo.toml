@@ -68,6 +68,11 @@ shuttle = { version = "0.9.1", optional = true }
 [features]
 analysis = []
 cpu-profiling = ["dep:dial9-perf-self-profile"]
+socket-accept-queues = [
+    "dep:netlink-packet-core",
+    "dep:netlink-packet-sock-diag",
+    "dep:netlink-sys",
+]
 _shuttle = [
     "dep:shuttle",
     "metrique-timesource/custom-timesource",
@@ -95,6 +100,7 @@ __nonlinux_all_features = [
     "analysis",
     "cpu-profiling",
     "memory-profiling",
+    "socket-accept-queues",
     "tracing-layer",
     "worker-s3",
 ]
@@ -146,13 +152,14 @@ dial9-tokio-telemetry = { path = ".", features = [
     "analysis",
     "taskdump",
     "tracing-layer",
+    "socket-accept-queues",
 ] }
 nix = { version = "0.29", features = ["process"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-netlink-packet-core = "0.7"
-netlink-packet-sock-diag = "0.4.2"
-netlink-sys = "0.8.8"
+netlink-packet-core = { version = "0.7", optional = true }
+netlink-packet-sock-diag = { version = "0.4.2", optional = true }
+netlink-sys = { version = "0.8.8", optional = true }
 
 [[bench]]
 name = "overhead_bench"

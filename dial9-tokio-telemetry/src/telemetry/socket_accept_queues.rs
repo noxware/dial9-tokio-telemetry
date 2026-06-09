@@ -28,6 +28,19 @@ impl SocketAcceptQueuesConfig {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_sample_interval_is_one_second() {
+        assert_eq!(
+            SocketAcceptQueuesConfig::default().sample_interval(),
+            Duration::from_secs(1)
+        );
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::SocketAcceptQueuesConfig;
@@ -330,30 +343,8 @@ mod linux {
         fn parse_socket_inode_ignores_non_socket_symlink() {
             assert_eq!(parse_socket_inode(Path::new("/dev/null")).unwrap(), None);
         }
-
-        #[test]
-        fn default_sample_interval_is_one_second() {
-            assert_eq!(
-                SocketAcceptQueuesConfig::default().sample_interval(),
-                Duration::from_secs(1)
-            );
-        }
     }
 }
 
 #[cfg(target_os = "linux")]
 pub(crate) use linux::SocketAcceptQueuesSource;
-
-#[cfg(not(target_os = "linux"))]
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_sample_interval_is_one_second() {
-        assert_eq!(
-            SocketAcceptQueuesConfig::default().sample_interval(),
-            Duration::from_secs(1)
-        );
-    }
-}
