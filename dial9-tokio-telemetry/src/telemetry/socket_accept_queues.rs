@@ -196,11 +196,9 @@ mod linux {
             ));
         }
 
-        let mut response_bytes = vec![0; 32 * 1024];
         loop {
-            let mut response_slice = &mut response_bytes[..];
-            let received = socket.recv(&mut response_slice, 0)?;
-            if received == 0 {
+            let (response_bytes, _sender) = socket.recv_from_full()?;
+            if response_bytes.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "sock_diag netlink socket returned an empty response",
@@ -208,7 +206,7 @@ mod linux {
             }
 
             let done = parse_response_datagram(
-                &response_bytes[..received],
+                &response_bytes,
                 sequence_number,
                 socket_inodes,
                 snapshots,
@@ -232,6 +230,12 @@ mod linux {
             let remaining = &bytes[offset..];
             let packet = NetlinkBuffer::new_checked(&remaining).map_err(decode_error)?;
             let packet_len = packet.length() as usize;
+            if packet_len == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "sock_diag returned zero-length netlink message",
+                ));
+            }
             let message = NetlinkMessage::<SockDiagMessage>::deserialize(&remaining[..packet_len])
                 .map_err(decode_error)?;
 
