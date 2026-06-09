@@ -663,12 +663,21 @@
     }
     const hasTimeFilter = startTime > 0 || endTime < Infinity;
 
-    // Compute timestamp bounds from events (safe for large arrays)
-    let evMinTs = Infinity, evMaxTs = -Infinity;
-    for (let i = 0; i < events.length; i++) {
-      const t = events[i].timestamp;
-      if (t < evMinTs) evMinTs = t;
-      if (t > evMaxTs) evMaxTs = t;
+    // Compute timestamp bounds from every parsed time-bearing stream.
+    let minTs = Infinity, maxTs = -Infinity;
+    function includeTimestamp(t) {
+      if (t == null) return;
+      if (t < minTs) minTs = t;
+      if (t > maxTs) maxTs = t;
+    }
+    for (let i = 0; i < events.length; i++) includeTimestamp(events[i].timestamp);
+    for (let i = 0; i < cpuSamples.length; i++) includeTimestamp(cpuSamples[i].timestamp);
+    for (let i = 0; i < customEvents.length; i++) includeTimestamp(customEvents[i].timestamp);
+    for (let i = 0; i < allocEvents.length; i++) includeTimestamp(allocEvents[i].timestamp);
+    for (let i = 0; i < freeEvents.length; i++) includeTimestamp(freeEvents[i].timestamp);
+    for (let i = 0; i < memoryOverflows.length; i++) includeTimestamp(memoryOverflows[i].timestamp);
+    for (const dumps of taskDumps.values()) {
+      for (let i = 0; i < dumps.length; i++) includeTimestamp(dumps[i].timestamp);
     }
 
     // Second pass: derive worker attribution from WorkerPark/WorkerUnpark
@@ -681,8 +690,8 @@
       magic: "D9TF",
       version: dec.version,
       events,
-      minTs: events.length > 0 ? evMinTs : null,
-      maxTs: events.length > 0 ? evMaxTs : null,
+      minTs: minTs === Infinity ? null : minTs,
+      maxTs: maxTs === -Infinity ? null : maxTs,
       truncated: events.length >= maxEvents,
       timeFiltered: hasTimeFilter,
       filterStartTime: hasTimeFilter ? startTime : null,
