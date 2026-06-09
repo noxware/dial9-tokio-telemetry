@@ -19,6 +19,7 @@ pub(crate) mod events;
 pub(crate) mod format;
 pub(crate) mod process_resource_usage;
 pub(crate) mod recorder;
+#[cfg(feature = "socket-accept-queues")]
 pub(crate) mod socket_accept_queues;
 pub mod task_dump_config;
 pub(crate) mod task_metadata;
@@ -40,6 +41,7 @@ pub use recorder::{
     TelemetryHandle, TelemetryRuntimeError, TokioHooks, TraceRuntimeCoreBuilder, TracedRuntime,
     TracedRuntimeBuilder, current_worker_id, spawn,
 };
+#[cfg(feature = "socket-accept-queues")]
 pub use socket_accept_queues::SocketAcceptQueuesConfig;
 pub use task_dump_config::TaskDumpConfig;
 pub use task_metadata::{TaskId, UNKNOWN_TASK_ID};

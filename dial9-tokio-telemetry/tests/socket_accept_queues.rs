@@ -1,17 +1,13 @@
+#![cfg(all(target_os = "linux", feature = "socket-accept-queues"))]
+
 mod common;
 
-#[cfg(target_os = "linux")]
 use common::{BytesCapturingWriter, decode_all};
-#[cfg(target_os = "linux")]
 use dial9_tokio_telemetry::telemetry::analysis_events::Dial9Event;
-#[cfg(target_os = "linux")]
 use dial9_tokio_telemetry::telemetry::{SocketAcceptQueuesConfig, TracedRuntime};
-#[cfg(target_os = "linux")]
 use std::net::{TcpListener, TcpStream};
-#[cfg(target_os = "linux")]
 use std::time::Duration;
 
-#[cfg(target_os = "linux")]
 #[test]
 fn traced_runtime_records_socket_accept_queue_snapshot() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -60,7 +56,6 @@ fn traced_runtime_records_socket_accept_queue_snapshot() {
     assert!(snapshot.backlog_limit >= snapshot.pending_connections);
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn traced_runtime_does_not_record_socket_accept_queues_by_default() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
