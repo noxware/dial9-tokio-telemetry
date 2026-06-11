@@ -183,11 +183,13 @@ pub struct ProcessResourceUsageEvent {
 /// Wire-format event for a TCP listener accept queue snapshot.
 #[derive(Debug, TraceEvent)]
 #[traceevent(wire_slot)]
-#[cfg_attr(not(feature = "unstable-events"), non_exhaustive)]
-pub struct SocketAcceptQueueEvent {
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct SocketAcceptQueueEvent {
     /// Monotonic timestamp in nanoseconds.
     #[traceevent(timestamp)]
     pub timestamp_ns: u64,
+    /// Linux socket cookie reported by sock_diag.
+    pub socket_cookie: u64,
     /// Linux socket inode reported by sock_diag.
     pub socket_inode: u64,
     /// IP version for `local_addr`: 4 or 6.

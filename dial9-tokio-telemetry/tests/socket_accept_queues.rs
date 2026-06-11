@@ -47,6 +47,7 @@ fn traced_runtime_records_socket_accept_queue_snapshot() {
         .unwrap_or_else(|| panic!("expected snapshot for listener port {local_addr}"));
 
     assert!(snapshot.timestamp_ns > 0);
+    assert!(snapshot.socket_cookie > 0);
     assert!(snapshot.socket_inode > 0);
     assert_eq!(snapshot.ip_version, 4);
     assert_eq!(snapshot.protocol, 6);

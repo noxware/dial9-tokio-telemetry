@@ -30,9 +30,8 @@ pub use buffer::{Encodable, ThreadLocalEncoder};
 pub use custom_events::{CustomEventsConfig, CustomEventsContext};
 pub use events::{CpuSampleSource, clock_monotonic_ns};
 pub use format::{
-    AllocEvent, FreeEvent, PollEndEvent, PollStartEvent, ProcessResourceUsageEvent,
-    SocketAcceptQueueEvent, TaskSpawnEvent, WakeEventEvent, WorkerId, WorkerParkEvent,
-    WorkerUnparkEvent,
+    AllocEvent, FreeEvent, PollEndEvent, PollStartEvent, ProcessResourceUsageEvent, TaskSpawnEvent,
+    WakeEventEvent, WorkerId, WorkerParkEvent, WorkerUnparkEvent,
 };
 pub use process_resource_usage::ProcessResourceUsageConfig;
 pub use recorder::{

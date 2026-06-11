@@ -315,6 +315,8 @@ pub struct ProcessResourceUsageEvent {
 pub struct SocketAcceptQueueEvent {
     /// Timestamp in nanoseconds (monotonic).
     pub timestamp_ns: u64,
+    /// Linux socket cookie reported by sock_diag.
+    pub socket_cookie: u64,
     /// Linux socket inode reported by sock_diag.
     pub socket_inode: u64,
     /// IP version for `local_addr`: 4 or 6.
@@ -600,6 +602,7 @@ mod tests {
         // 16. SocketAcceptQueueEvent
         enc.write(&format::SocketAcceptQueueEvent {
             timestamp_ns: 15_000_000,
+            socket_cookie: 67890,
             socket_inode: 12345,
             ip_version: 4,
             protocol: 6,
@@ -770,6 +773,7 @@ mod tests {
             panic!("expected SocketAcceptQueueEvent, got {:?}", events[15]);
         };
         assert_eq!(e.timestamp_ns, 15_000_000);
+        assert_eq!(e.socket_cookie, 67890);
         assert_eq!(e.socket_inode, 12345);
         assert_eq!(e.ip_version, 4);
         assert_eq!(e.protocol, 6);

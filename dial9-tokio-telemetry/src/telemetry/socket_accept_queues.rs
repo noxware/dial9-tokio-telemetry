@@ -55,11 +55,11 @@ mod linux {
     use netlink_packet_sock_diag::inet::{ExtensionFlags, InetRequest, SocketId, StateFlags};
     use netlink_packet_sock_diag::{AF_INET, AF_INET6, IPPROTO_TCP, SockDiagMessage, TCP_LISTEN};
     use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_SOCK_DIAG};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::io;
     use std::net::IpAddr;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
     /// Flush-thread source that samples TCP listener accept queue depth.
@@ -67,11 +67,24 @@ mod linux {
     pub(crate) struct SocketAcceptQueuesSource {
         config: SocketAcceptQueuesConfig,
         last_sample: Option<Instant>,
+        cache: SocketAcceptQueueCache,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    struct SocketKey {
+        inode: u64,
+        cookie: u64,
+    }
+
+    #[derive(Debug, Default)]
+    struct SocketAcceptQueueCache {
+        owned: HashMap<SocketKey, PathBuf>,
+        foreign: HashSet<SocketKey>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct SocketAcceptQueueSnapshot {
-        socket_inode: u64,
+        key: SocketKey,
         ip_version: u8,
         protocol: u8,
         local_addr: IpAddr,
@@ -85,7 +98,15 @@ mod linux {
             Self {
                 config,
                 last_sample: None,
+                cache: SocketAcceptQueueCache::default(),
             }
+        }
+    }
+
+    impl SocketAcceptQueueCache {
+        fn prune(&mut self, active_keys: &HashSet<SocketKey>) {
+            self.owned.retain(|key, _| active_keys.contains(key));
+            self.foreign.retain(|key| active_keys.contains(key));
         }
     }
 
@@ -99,7 +120,7 @@ mod linux {
             }
             self.last_sample = Some(now);
 
-            match collect_socket_accept_queues() {
+            match collect_socket_accept_queues(&mut self.cache) {
                 Ok(snapshots) => {
                     let timestamp_ns = clock_monotonic_ns();
                     for snapshot in snapshots {
@@ -125,7 +146,8 @@ mod linux {
         fn into_event(self, timestamp_ns: u64) -> SocketAcceptQueueEvent {
             SocketAcceptQueueEvent {
                 timestamp_ns,
-                socket_inode: self.socket_inode,
+                socket_cookie: self.key.cookie,
+                socket_inode: self.key.inode,
                 ip_version: self.ip_version,
                 protocol: self.protocol,
                 local_addr: self.local_addr.to_string(),
@@ -136,28 +158,29 @@ mod linux {
         }
     }
 
-    fn collect_socket_accept_queues() -> io::Result<Vec<SocketAcceptQueueSnapshot>> {
-        let socket_inodes = current_process_socket_inodes()?;
-        if socket_inodes.is_empty() {
-            return Ok(Vec::new());
-        }
-
+    fn collect_socket_accept_queues(
+        cache: &mut SocketAcceptQueueCache,
+    ) -> io::Result<Vec<SocketAcceptQueueSnapshot>> {
         let mut socket = Socket::new(NETLINK_SOCK_DIAG)?;
         let _local_addr = socket.bind_auto()?;
         let kernel_addr = SocketAddr::new(0, 0);
         socket.connect(&kernel_addr)?;
 
         let mut snapshots = Vec::new();
-        dump_tcp_listeners(&socket, AF_INET, 1, &socket_inodes, &mut snapshots)?;
-        dump_tcp_listeners(&socket, AF_INET6, 2, &socket_inodes, &mut snapshots)?;
-        Ok(snapshots)
+        dump_tcp_listeners(&socket, AF_INET, 1, &mut snapshots)?;
+        dump_tcp_listeners(&socket, AF_INET6, 2, &mut snapshots)?;
+        classify_process_listeners(
+            snapshots,
+            cache,
+            read_socket_inode_for_fd_path,
+            scan_process_socket_fds,
+        )
     }
 
     fn dump_tcp_listeners(
         socket: &Socket,
         family: u8,
         sequence_number: u32,
-        socket_inodes: &HashSet<u64>,
         snapshots: &mut Vec<SocketAcceptQueueSnapshot>,
     ) -> io::Result<()> {
         let socket_id = match family {
@@ -205,12 +228,7 @@ mod linux {
                 ));
             }
 
-            let done = parse_response_datagram(
-                &response_bytes,
-                sequence_number,
-                socket_inodes,
-                snapshots,
-            )?;
+            let done = parse_response_datagram(&response_bytes, sequence_number, snapshots)?;
             if done {
                 return Ok(());
             }
@@ -220,7 +238,6 @@ mod linux {
     fn parse_response_datagram(
         bytes: &[u8],
         sequence_number: u32,
-        socket_inodes: &HashSet<u64>,
         snapshots: &mut Vec<SocketAcceptQueueSnapshot>,
     ) -> io::Result<bool> {
         let mut offset = 0;
@@ -248,7 +265,7 @@ mod linux {
                         }
                     }
                     NetlinkPayload::InnerMessage(SockDiagMessage::InetResponse(response)) => {
-                        if let Some(snapshot) = snapshot_from_response(&response, socket_inodes) {
+                        if let Some(snapshot) = snapshot_from_response(&response) {
                             snapshots.push(snapshot);
                         }
                     }
@@ -264,16 +281,18 @@ mod linux {
 
     fn snapshot_from_response(
         response: &netlink_packet_sock_diag::inet::InetResponse,
-        socket_inodes: &HashSet<u64>,
     ) -> Option<SocketAcceptQueueSnapshot> {
         let header = &response.header;
         let socket_inode = u64::from(header.inode);
-        if header.state != TCP_LISTEN || !socket_inodes.contains(&socket_inode) {
+        if header.state != TCP_LISTEN {
             return None;
         }
 
         Some(SocketAcceptQueueSnapshot {
-            socket_inode,
+            key: SocketKey {
+                inode: socket_inode,
+                cookie: socket_cookie_from_diag(header.socket_id.cookie),
+            },
             ip_version: match header.family {
                 AF_INET => 4,
                 AF_INET6 => 6,
@@ -287,21 +306,85 @@ mod linux {
         })
     }
 
-    fn current_process_socket_inodes() -> io::Result<HashSet<u64>> {
-        let mut inodes = HashSet::new();
-        for entry in fs::read_dir("/proc/self/fd")? {
-            let entry = entry?;
-            match fs::read_link(entry.path()) {
-                Ok(target) => {
-                    if let Some(inode) = parse_socket_inode(&target)? {
-                        inodes.insert(inode);
-                    }
+    fn classify_process_listeners(
+        snapshots: Vec<SocketAcceptQueueSnapshot>,
+        cache: &mut SocketAcceptQueueCache,
+        mut read_fd_inode: impl FnMut(&Path) -> io::Result<Option<u64>>,
+        mut scan_socket_fds: impl FnMut(&HashSet<u64>) -> io::Result<HashMap<u64, PathBuf>>,
+    ) -> io::Result<Vec<SocketAcceptQueueSnapshot>> {
+        // The expensive operation is walking /proc/self/fd. Do it only when
+        // sock_diag reports a listener we have not classified before.
+        let active_keys = snapshots
+            .iter()
+            .map(|snapshot| snapshot.key)
+            .collect::<HashSet<_>>();
+        cache.prune(&active_keys);
+
+        let mut owned_snapshots = Vec::new();
+        let mut unknown_snapshots = Vec::new();
+        let mut unknown_inodes = HashSet::new();
+
+        for snapshot in snapshots {
+            if let Some(fd_path) = cache.owned.get(&snapshot.key).cloned() {
+                if read_fd_inode(&fd_path)? == Some(snapshot.key.inode) {
+                    owned_snapshots.push(snapshot);
+                    continue;
                 }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
+                cache.owned.remove(&snapshot.key);
+            }
+
+            if cache.foreign.contains(&snapshot.key) {
+                continue;
+            }
+
+            unknown_inodes.insert(snapshot.key.inode);
+            unknown_snapshots.push(snapshot);
+        }
+
+        if unknown_snapshots.is_empty() {
+            return Ok(owned_snapshots);
+        }
+
+        let owned_fds_by_inode = scan_socket_fds(&unknown_inodes)?;
+        for snapshot in unknown_snapshots {
+            if let Some(fd_path) = owned_fds_by_inode.get(&snapshot.key.inode) {
+                cache.owned.insert(snapshot.key, fd_path.clone());
+                owned_snapshots.push(snapshot);
+            } else {
+                cache.foreign.insert(snapshot.key);
             }
         }
-        Ok(inodes)
+
+        Ok(owned_snapshots)
+    }
+
+    fn scan_process_socket_fds(target_inodes: &HashSet<u64>) -> io::Result<HashMap<u64, PathBuf>> {
+        let mut fds_by_inode = HashMap::new();
+        if target_inodes.is_empty() {
+            return Ok(fds_by_inode);
+        }
+
+        for entry in fs::read_dir("/proc/self/fd")? {
+            let entry = entry?;
+            let path = entry.path();
+            if let Some(inode) = read_socket_inode_for_fd_path(&path)?
+                && target_inodes.contains(&inode)
+            {
+                fds_by_inode.entry(inode).or_insert(path);
+                if fds_by_inode.len() == target_inodes.len() {
+                    break;
+                }
+            }
+        }
+        Ok(fds_by_inode)
+    }
+
+    fn read_socket_inode_for_fd_path(path: &Path) -> io::Result<Option<u64>> {
+        match fs::read_link(path) {
+            Ok(target) => parse_socket_inode(&target),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     fn parse_socket_inode(path: &Path) -> io::Result<Option<u64>> {
@@ -323,6 +406,12 @@ mod linux {
         })
     }
 
+    fn socket_cookie_from_diag(bytes: [u8; 8]) -> u64 {
+        let low = u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64;
+        let high = u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as u64;
+        (high << 32) | low
+    }
+
     fn decode_error(error: impl std::fmt::Display) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidData, error.to_string())
     }
@@ -334,6 +423,9 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::cell::Cell;
+        use std::collections::HashMap;
+        use std::path::PathBuf;
 
         #[test]
         fn parse_socket_inode_extracts_socket_symlink_inode() {
@@ -346,6 +438,141 @@ mod linux {
         #[test]
         fn parse_socket_inode_ignores_non_socket_symlink() {
             assert_eq!(parse_socket_inode(Path::new("/dev/null")).unwrap(), None);
+        }
+
+        #[test]
+        fn cached_owned_listener_does_not_scan_process_fds_again() {
+            let key = SocketKey {
+                inode: 123,
+                cookie: 456,
+            };
+            let snapshot = snapshot_with_key(key);
+            let fd_path = PathBuf::from("/proc/self/fd/7");
+            let mut cache = SocketAcceptQueueCache::default();
+            cache.owned.insert(key, fd_path.clone());
+            let scans = Cell::new(0);
+
+            let snapshots = classify_process_listeners(
+                vec![snapshot.clone()],
+                &mut cache,
+                |path| {
+                    assert_eq!(path, fd_path.as_path());
+                    Ok(Some(key.inode))
+                },
+                |_| {
+                    scans.set(scans.get() + 1);
+                    Ok(HashMap::new())
+                },
+            )
+            .unwrap();
+
+            assert_eq!(snapshots, vec![snapshot]);
+            assert_eq!(scans.get(), 0);
+        }
+
+        #[test]
+        fn unknown_listener_scans_once_and_caches_owned_listener() {
+            let key = SocketKey {
+                inode: 123,
+                cookie: 456,
+            };
+            let snapshot = snapshot_with_key(key);
+            let fd_path = PathBuf::from("/proc/self/fd/7");
+            let mut cache = SocketAcceptQueueCache::default();
+            let scans = Cell::new(0);
+
+            let snapshots = classify_process_listeners(
+                vec![snapshot.clone()],
+                &mut cache,
+                |_| panic!("unknown listeners should not validate cached fd paths"),
+                |target_inodes| {
+                    scans.set(scans.get() + 1);
+                    assert!(target_inodes.contains(&key.inode));
+                    Ok(HashMap::from([(key.inode, fd_path.clone())]))
+                },
+            )
+            .unwrap();
+
+            assert_eq!(snapshots, vec![snapshot]);
+            assert_eq!(cache.owned.get(&key), Some(&fd_path));
+            assert_eq!(scans.get(), 1);
+        }
+
+        #[test]
+        fn cached_foreign_listener_does_not_rescan() {
+            let key = SocketKey {
+                inode: 123,
+                cookie: 456,
+            };
+            let mut cache = SocketAcceptQueueCache::default();
+            cache.foreign.insert(key);
+            let scans = Cell::new(0);
+
+            let snapshots = classify_process_listeners(
+                vec![snapshot_with_key(key)],
+                &mut cache,
+                |_| panic!("foreign listeners should not validate fd paths"),
+                |_| {
+                    scans.set(scans.get() + 1);
+                    Ok(HashMap::new())
+                },
+            )
+            .unwrap();
+
+            assert!(snapshots.is_empty());
+            assert_eq!(scans.get(), 0);
+        }
+
+        #[test]
+        fn inactive_cache_entries_are_pruned_before_classification() {
+            let old_key = SocketKey {
+                inode: 123,
+                cookie: 456,
+            };
+            let new_key = SocketKey {
+                inode: 123,
+                cookie: 789,
+            };
+            let fd_path = PathBuf::from("/proc/self/fd/7");
+            let mut cache = SocketAcceptQueueCache::default();
+            cache.foreign.insert(old_key);
+
+            let snapshots = classify_process_listeners(
+                vec![snapshot_with_key(new_key)],
+                &mut cache,
+                |_| panic!("new listener should be unknown, not cached"),
+                |_| Ok(HashMap::from([(new_key.inode, fd_path.clone())])),
+            )
+            .unwrap();
+
+            assert_eq!(snapshots, vec![snapshot_with_key(new_key)]);
+            assert!(!cache.foreign.contains(&old_key));
+            assert_eq!(cache.owned.get(&new_key), Some(&fd_path));
+        }
+
+        #[test]
+        fn socket_cookie_from_diag_combines_kernel_cookie_words() {
+            let low = 0x5566_7788_u32.to_ne_bytes();
+            let high = 0x1122_3344_u32.to_ne_bytes();
+
+            assert_eq!(
+                socket_cookie_from_diag([
+                    low[0], low[1], low[2], low[3], high[0], high[1], high[2], high[3],
+                ]),
+                0x1122_3344_5566_7788
+            );
+        }
+
+        fn snapshot_with_key(key: SocketKey) -> SocketAcceptQueueSnapshot {
+            SocketAcceptQueueSnapshot {
+                key,
+                ip_version: 4,
+                protocol: 6,
+                local_addr: "127.0.0.1".parse().unwrap(),
+                local_port: 8080,
+                pending_connections: 1,
+                backlog_limit: 128,
+            }
         }
     }
 }
