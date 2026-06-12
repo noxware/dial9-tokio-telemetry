@@ -65,7 +65,7 @@ mod linux {
     use crate::rate_limit::rate_limited;
     use crate::telemetry::buffer::record_encodable_event;
     use crate::telemetry::events::clock_monotonic_ns;
-    use crate::telemetry::format::SocketAcceptQueueEvent;
+    use crate::telemetry::format::TcpAcceptQueueEvent;
     use crate::telemetry::recorder::source::{FlushContext, Source};
     use netlink_packet_core::{
         NLM_F_DUMP, NLM_F_REQUEST, NetlinkBuffer, NetlinkMessage, NetlinkPayload,
@@ -106,7 +106,7 @@ mod linux {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
-    struct SocketAcceptQueueSnapshot {
+    struct TcpAcceptQueueSnapshot {
         key: SocketKey,
         ip_version: u8,
         local_addr: IpAddr,
@@ -164,9 +164,9 @@ mod linux {
         }
     }
 
-    impl SocketAcceptQueueSnapshot {
-        fn into_event(self, timestamp_ns: u64) -> SocketAcceptQueueEvent {
-            SocketAcceptQueueEvent {
+    impl TcpAcceptQueueSnapshot {
+        fn into_event(self, timestamp_ns: u64) -> TcpAcceptQueueEvent {
+            TcpAcceptQueueEvent {
                 timestamp_ns,
                 socket_cookie: self.key.cookie,
                 socket_inode: self.key.inode,
@@ -181,7 +181,7 @@ mod linux {
 
     fn collect_socket_accept_queues(
         cache: &mut SocketAcceptQueueCache,
-    ) -> io::Result<Vec<SocketAcceptQueueSnapshot>> {
+    ) -> io::Result<Vec<TcpAcceptQueueSnapshot>> {
         let mut socket = Socket::new(NETLINK_SOCK_DIAG)?;
         set_socket_receive_timeout(&socket, NETLINK_RECEIVE_TIMEOUT)?;
         let _local_addr = socket.bind_auto()?;
@@ -203,7 +203,7 @@ mod linux {
         socket: &Socket,
         family: u8,
         sequence_number: u32,
-        snapshots: &mut Vec<SocketAcceptQueueSnapshot>,
+        snapshots: &mut Vec<TcpAcceptQueueSnapshot>,
     ) -> io::Result<()> {
         let socket_id = match family {
             AF_INET => SocketId::new_v4(),
@@ -260,7 +260,7 @@ mod linux {
     fn parse_response_datagram(
         bytes: &[u8],
         sequence_number: u32,
-        snapshots: &mut Vec<SocketAcceptQueueSnapshot>,
+        snapshots: &mut Vec<TcpAcceptQueueSnapshot>,
     ) -> io::Result<bool> {
         let mut offset = 0;
         let mut done = false;
@@ -303,14 +303,14 @@ mod linux {
 
     fn snapshot_from_response(
         response: &netlink_packet_sock_diag::inet::InetResponse,
-    ) -> Option<SocketAcceptQueueSnapshot> {
+    ) -> Option<TcpAcceptQueueSnapshot> {
         let header = &response.header;
         let socket_inode = u64::from(header.inode);
         if header.state != TCP_LISTEN {
             return None;
         }
 
-        Some(SocketAcceptQueueSnapshot {
+        Some(TcpAcceptQueueSnapshot {
             key: SocketKey {
                 inode: socket_inode,
                 cookie: socket_cookie_from_diag(header.socket_id.cookie),
@@ -328,11 +328,11 @@ mod linux {
     }
 
     fn classify_process_listeners(
-        snapshots: Vec<SocketAcceptQueueSnapshot>,
+        snapshots: Vec<TcpAcceptQueueSnapshot>,
         cache: &mut SocketAcceptQueueCache,
         mut read_fd_inode: impl FnMut(&Path) -> io::Result<Option<u64>>,
         mut scan_socket_fds: impl FnMut(&HashSet<u64>) -> io::Result<HashMap<u64, PathBuf>>,
-    ) -> io::Result<Vec<SocketAcceptQueueSnapshot>> {
+    ) -> io::Result<Vec<TcpAcceptQueueSnapshot>> {
         // The expensive operation is walking /proc/self/fd. Do it only when
         // sock_diag reports a listener we have not classified before.
         let active_keys = snapshots
@@ -626,8 +626,8 @@ mod linux {
             );
         }
 
-        fn snapshot_with_key(key: SocketKey) -> SocketAcceptQueueSnapshot {
-            SocketAcceptQueueSnapshot {
+        fn snapshot_with_key(key: SocketKey) -> TcpAcceptQueueSnapshot {
+            TcpAcceptQueueSnapshot {
                 key,
                 ip_version: 4,
                 local_addr: "127.0.0.1".parse().unwrap(),

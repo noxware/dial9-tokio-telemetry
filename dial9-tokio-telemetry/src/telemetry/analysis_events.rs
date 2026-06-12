@@ -312,7 +312,7 @@ pub struct ProcessResourceUsageEvent {
 /// TCP listener accept queue snapshot.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[non_exhaustive]
-pub struct SocketAcceptQueueEvent {
+pub struct TcpAcceptQueueEvent {
     /// Timestamp in nanoseconds (monotonic).
     pub timestamp_ns: u64,
     /// Linux socket cookie reported by sock_diag.
@@ -422,7 +422,7 @@ pub enum Dial9Event {
     /// Process resource usage.
     ProcessResourceUsageEvent(ProcessResourceUsageEvent),
     /// TCP listener accept queue snapshot.
-    SocketAcceptQueueEvent(SocketAcceptQueueEvent),
+    TcpAcceptQueueEvent(TcpAcceptQueueEvent),
     /// An application-defined custom event. Produced by
     /// [`TraceReader`](crate::telemetry::analysis::TraceReader) for unknown
     /// event types. Not populated by direct serde deserialization (use
@@ -597,8 +597,8 @@ mod tests {
         })
         .unwrap();
 
-        // 16. SocketAcceptQueueEvent
-        enc.write(&format::SocketAcceptQueueEvent {
+        // 16. TcpAcceptQueueEvent
+        enc.write(&format::TcpAcceptQueueEvent {
             timestamp_ns: 15_000_000,
             socket_cookie: 67890,
             socket_inode: 12345,
@@ -765,9 +765,9 @@ mod tests {
         assert_eq!(e.voluntary_context_switches, 4);
         assert_eq!(e.involuntary_context_switches, 5);
 
-        // 16. SocketAcceptQueueEvent
-        let Dial9Event::SocketAcceptQueueEvent(ref e) = events[15] else {
-            panic!("expected SocketAcceptQueueEvent, got {:?}", events[15]);
+        // 16. TcpAcceptQueueEvent
+        let Dial9Event::TcpAcceptQueueEvent(ref e) = events[15] else {
+            panic!("expected TcpAcceptQueueEvent, got {:?}", events[15]);
         };
         assert_eq!(e.timestamp_ns, 15_000_000);
         assert_eq!(e.socket_cookie, 67890);

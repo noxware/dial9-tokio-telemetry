@@ -39,7 +39,7 @@ fn traced_runtime_records_socket_accept_queue_snapshot() {
     let snapshots: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
-            Dial9Event::SocketAcceptQueueEvent(event) => Some(event),
+            Dial9Event::TcpAcceptQueueEvent(event) => Some(event),
             _ => None,
         })
         .collect();
@@ -86,7 +86,7 @@ fn traced_runtime_does_not_record_socket_accept_queues_by_default() {
     assert!(
         events
             .iter()
-            .all(|event| !matches!(event, Dial9Event::SocketAcceptQueueEvent(_))),
+            .all(|event| !matches!(event, Dial9Event::TcpAcceptQueueEvent(_))),
         "socket accept queue snapshots should be opt-in"
     );
 }

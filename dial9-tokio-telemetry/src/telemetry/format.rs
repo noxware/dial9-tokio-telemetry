@@ -184,7 +184,7 @@ pub struct ProcessResourceUsageEvent {
 #[derive(Debug, TraceEvent)]
 #[traceevent(wire_slot)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) struct SocketAcceptQueueEvent {
+pub(crate) struct TcpAcceptQueueEvent {
     /// Monotonic timestamp in nanoseconds.
     #[traceevent(timestamp)]
     pub(crate) timestamp_ns: u64,
