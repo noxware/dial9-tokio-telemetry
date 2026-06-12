@@ -187,23 +187,23 @@ pub struct ProcessResourceUsageEvent {
 pub(crate) struct SocketAcceptQueueEvent {
     /// Monotonic timestamp in nanoseconds.
     #[traceevent(timestamp)]
-    pub timestamp_ns: u64,
+    pub(crate) timestamp_ns: u64,
     /// Linux socket cookie reported by sock_diag.
-    pub socket_cookie: u64,
+    pub(crate) socket_cookie: u64,
     /// Linux socket inode reported by sock_diag.
-    pub socket_inode: u64,
+    pub(crate) socket_inode: u64,
     /// IP version for `local_addr`: 4 or 6.
-    pub ip_version: u8,
+    pub(crate) ip_version: u8,
     /// IP protocol number. TCP is 6.
-    pub protocol: u8,
+    pub(crate) protocol: u8,
     /// Local listener address.
-    pub local_addr: String,
+    pub(crate) local_addr: String,
     /// Local listener port.
-    pub local_port: u16,
+    pub(crate) local_port: u16,
     /// Completed connections waiting to be accepted.
-    pub pending_connections: u32,
+    pub(crate) pending_connections: u32,
     /// Effective accept backlog limit.
-    pub backlog_limit: u32,
+    pub(crate) backlog_limit: u32,
 }
 
 /// Wire-format event for a task spawn.
