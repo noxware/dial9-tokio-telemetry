@@ -77,8 +77,11 @@ mod linux {
     use std::fs;
     use std::io;
     use std::net::IpAddr;
+    use std::os::fd::AsRawFd;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
+
+    const NETLINK_RECEIVE_TIMEOUT: Duration = Duration::from_millis(100);
 
     /// Flush-thread source that samples TCP listener accept queue depth.
     #[derive(Debug)]
@@ -180,6 +183,7 @@ mod linux {
         cache: &mut SocketAcceptQueueCache,
     ) -> io::Result<Vec<SocketAcceptQueueSnapshot>> {
         let mut socket = Socket::new(NETLINK_SOCK_DIAG)?;
+        set_socket_receive_timeout(&socket, NETLINK_RECEIVE_TIMEOUT)?;
         let _local_addr = socket.bind_auto()?;
         let kernel_addr = SocketAddr::new(0, 0);
         socket.connect(&kernel_addr)?;
@@ -376,6 +380,31 @@ mod linux {
         }
 
         Ok(owned_snapshots)
+    }
+
+    fn set_socket_receive_timeout(socket: &Socket, timeout: Duration) -> io::Result<()> {
+        let tv_sec: libc::time_t = timeout.as_secs().try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("socket receive timeout {timeout:?} exceeds libc::time_t"),
+            )
+        })?;
+        let tv_usec: libc::suseconds_t = timeout.subsec_micros().into();
+        let timeout = libc::timeval { tv_sec, tv_usec };
+
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &timeout as *const libc::timeval as *const libc::c_void,
+                std::mem::size_of_val(&timeout) as libc::socklen_t,
+            )
+        };
+        if result == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     fn scan_process_socket_fds(target_inodes: &HashSet<u64>) -> io::Result<HashMap<u64, PathBuf>> {
