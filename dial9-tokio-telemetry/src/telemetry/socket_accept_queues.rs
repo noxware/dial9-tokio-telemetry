@@ -343,19 +343,21 @@ mod linux {
         let mut unknown_inodes = HashSet::new();
 
         for snapshot in snapshots {
-            if let Some(fd_path) = cache.owned.get(&snapshot.key).cloned() {
-                if read_fd_inode(&fd_path)? == Some(snapshot.key.inode) {
+            let key = snapshot.key;
+
+            if let Some(fd_path) = cache.owned.get(&key) {
+                if read_fd_inode(fd_path)? == Some(key.inode) {
                     owned_snapshots.push(snapshot);
                     continue;
                 }
-                cache.owned.remove(&snapshot.key);
+                cache.owned.remove(&key);
             }
 
-            if cache.foreign.contains(&snapshot.key) {
+            if cache.foreign.contains(&key) {
                 continue;
             }
 
-            unknown_inodes.insert(snapshot.key.inode);
+            unknown_inodes.insert(key.inode);
             unknown_snapshots.push(snapshot);
         }
 
