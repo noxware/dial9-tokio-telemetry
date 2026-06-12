@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_millis(400);
 
 /// Configuration for socket accept queue sampling.
 ///
@@ -51,10 +51,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_sample_interval_is_one_second() {
+    fn default_sample_interval_is_400ms() {
         assert_eq!(
             SocketAcceptQueuesConfig::default().sample_interval(),
-            Duration::from_secs(1)
+            Duration::from_millis(400)
         );
     }
 }
