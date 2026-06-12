@@ -53,7 +53,6 @@ fn traced_runtime_records_socket_accept_queue_snapshot() {
     assert!(snapshot.socket_cookie > 0);
     assert!(snapshot.socket_inode > 0);
     assert_eq!(snapshot.ip_version, 4);
-    assert_eq!(snapshot.protocol, 6);
     assert_eq!(snapshot.local_addr, "127.0.0.1");
     assert_eq!(snapshot.local_port, local_addr.port());
     assert!(snapshot.pending_connections >= 1);

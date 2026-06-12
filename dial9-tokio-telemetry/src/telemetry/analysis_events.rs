@@ -321,8 +321,6 @@ pub struct SocketAcceptQueueEvent {
     pub socket_inode: u64,
     /// IP version for `local_addr`: 4 or 6.
     pub ip_version: u8,
-    /// IP protocol number. TCP is 6.
-    pub protocol: u8,
     /// Local listener address.
     pub local_addr: String,
     /// Local listener port.
@@ -605,7 +603,6 @@ mod tests {
             socket_cookie: 67890,
             socket_inode: 12345,
             ip_version: 4,
-            protocol: 6,
             local_addr: "127.0.0.1".to_string(),
             local_port: 8080,
             pending_connections: 3,
@@ -776,7 +773,6 @@ mod tests {
         assert_eq!(e.socket_cookie, 67890);
         assert_eq!(e.socket_inode, 12345);
         assert_eq!(e.ip_version, 4);
-        assert_eq!(e.protocol, 6);
         assert_eq!(e.local_addr, "127.0.0.1");
         assert_eq!(e.local_port, 8080);
         assert_eq!(e.pending_connections, 3);

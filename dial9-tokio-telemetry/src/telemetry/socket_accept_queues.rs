@@ -107,7 +107,6 @@ mod linux {
     struct SocketAcceptQueueSnapshot {
         key: SocketKey,
         ip_version: u8,
-        protocol: u8,
         local_addr: IpAddr,
         local_port: u16,
         pending_connections: u32,
@@ -170,7 +169,6 @@ mod linux {
                 socket_cookie: self.key.cookie,
                 socket_inode: self.key.inode,
                 ip_version: self.ip_version,
-                protocol: self.protocol,
                 local_addr: self.local_addr.to_string(),
                 local_port: self.local_port,
                 pending_connections: self.pending_connections,
@@ -320,7 +318,6 @@ mod linux {
                 AF_INET6 => 6,
                 _ => return None,
             },
-            protocol: IPPROTO_TCP,
             local_addr: header.socket_id.source_address,
             local_port: header.socket_id.source_port,
             pending_connections: header.recv_queue,
@@ -631,7 +628,6 @@ mod linux {
             SocketAcceptQueueSnapshot {
                 key,
                 ip_version: 4,
-                protocol: 6,
                 local_addr: "127.0.0.1".parse().unwrap(),
                 local_port: 8080,
                 pending_connections: 1,

@@ -194,8 +194,6 @@ pub(crate) struct SocketAcceptQueueEvent {
     pub(crate) socket_inode: u64,
     /// IP version for `local_addr`: 4 or 6.
     pub(crate) ip_version: u8,
-    /// IP protocol number. TCP is 6.
-    pub(crate) protocol: u8,
     /// Local listener address.
     pub(crate) local_addr: String,
     /// Local listener port.
