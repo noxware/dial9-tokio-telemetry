@@ -383,14 +383,26 @@ mod linux {
     }
 
     fn set_socket_receive_timeout(socket: &Socket, timeout: Duration) -> io::Result<()> {
-        let tv_sec: libc::time_t = timeout.as_secs().try_into().map_err(|_| {
+        let timeout = libc::timeval {
+            tv_sec: timeout.as_secs().try_into().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("socket receive timeout {timeout:?} exceeds timeval.tv_sec"),
+                )
+            })?,
+            tv_usec: timeout.subsec_micros().try_into().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("socket receive timeout {timeout:?} exceeds timeval.tv_usec"),
+                )
+            })?,
+        };
+        let optlen: libc::socklen_t = std::mem::size_of_val(&timeout).try_into().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("socket receive timeout {timeout:?} exceeds libc::time_t"),
+                "timeval size exceeds libc::socklen_t",
             )
         })?;
-        let tv_usec: libc::suseconds_t = timeout.subsec_micros().into();
-        let timeout = libc::timeval { tv_sec, tv_usec };
 
         // SAFETY: `socket.as_raw_fd()` is a live netlink socket owned by `socket`,
         // `timeout` points to a properly initialized `timeval`, and the length
@@ -401,7 +413,7 @@ mod linux {
                 libc::SOL_SOCKET,
                 libc::SO_RCVTIMEO,
                 &timeout as *const libc::timeval as *const libc::c_void,
-                std::mem::size_of_val(&timeout) as libc::socklen_t,
+                optlen,
             )
         };
         if result == -1 {
