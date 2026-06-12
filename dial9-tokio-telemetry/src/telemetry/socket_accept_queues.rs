@@ -392,6 +392,9 @@ mod linux {
         let tv_usec: libc::suseconds_t = timeout.subsec_micros().into();
         let timeout = libc::timeval { tv_sec, tv_usec };
 
+        // SAFETY: `socket.as_raw_fd()` is a live netlink socket owned by `socket`,
+        // `timeout` points to a properly initialized `timeval`, and the length
+        // matches the pointed-to value for the duration of the syscall.
         let result = unsafe {
             libc::setsockopt(
                 socket.as_raw_fd(),
