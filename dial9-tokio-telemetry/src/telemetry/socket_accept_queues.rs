@@ -84,6 +84,8 @@ mod linux {
     const NETLINK_RECEIVE_TIMEOUT: Duration = Duration::from_millis(100);
 
     /// Flush-thread source that samples TCP listener accept queue depth.
+    ///
+    /// See [issue #501](https://github.com/dial9-rs/dial9/issues/501) for details.
     #[derive(Debug)]
     pub(crate) struct SocketAcceptQueuesSource {
         config: SocketAcceptQueuesConfig,
