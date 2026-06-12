@@ -2,9 +2,9 @@
 
 mod common;
 
-use common::{BytesCapturingWriter, decode_all};
+use common::{CAPTURE_BUFFER_SIZE, capture_processor, decode_all};
 use dial9_tokio_telemetry::telemetry::analysis_events::Dial9Event;
-use dial9_tokio_telemetry::telemetry::{SocketAcceptQueuesConfig, TracedRuntime};
+use dial9_tokio_telemetry::telemetry::{InMemoryWriter, SocketAcceptQueuesConfig, TracedRuntime};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
@@ -14,20 +14,23 @@ fn traced_runtime_records_socket_accept_queue_snapshot() {
     let local_addr = listener.local_addr().unwrap();
     let client = TcpStream::connect(local_addr).unwrap();
 
-    let (writer, batches) = BytesCapturingWriter::new();
+    let (capture, batches) = capture_processor();
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(1).enable_all();
     let (runtime, guard) = TracedRuntime::builder()
+        .with_custom_pipeline(|p| p.pipe(capture))
         .with_socket_accept_queues(
             SocketAcceptQueuesConfig::builder()
                 .sample_interval(Duration::ZERO)
                 .build(),
         )
-        .build_and_start_with_writer(builder, writer)
+        .build_and_start(builder, InMemoryWriter::new(CAPTURE_BUFFER_SIZE).unwrap())
         .unwrap();
 
     drop(runtime);
-    drop(guard);
+    guard
+        .graceful_shutdown(Duration::from_secs(1))
+        .expect("clean shutdown");
     drop(client);
     drop(listener);
 
@@ -63,15 +66,18 @@ fn traced_runtime_does_not_record_socket_accept_queues_by_default() {
     let local_addr = listener.local_addr().unwrap();
     let client = TcpStream::connect(local_addr).unwrap();
 
-    let (writer, batches) = BytesCapturingWriter::new();
+    let (capture, batches) = capture_processor();
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(1).enable_all();
     let (runtime, guard) = TracedRuntime::builder()
-        .build_and_start_with_writer(builder, writer)
+        .with_custom_pipeline(|p| p.pipe(capture))
+        .build_and_start(builder, InMemoryWriter::new(CAPTURE_BUFFER_SIZE).unwrap())
         .unwrap();
 
     drop(runtime);
-    drop(guard);
+    guard
+        .graceful_shutdown(Duration::from_secs(1))
+        .expect("clean shutdown");
     drop(client);
     drop(listener);
 
