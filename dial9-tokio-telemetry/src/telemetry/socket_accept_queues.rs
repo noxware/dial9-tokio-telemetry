@@ -8,6 +8,24 @@ const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 ///
 /// Built via `SocketAcceptQueuesConfig::builder()...build()` and enabled with
 /// [`TracedRuntimeBuilder::with_socket_accept_queues`](crate::telemetry::TracedRuntimeBuilder::with_socket_accept_queues).
+///
+/// # Performance
+///
+/// Full scans can be expensive because they walk `/proc/self/fd` to find this
+/// process's listeners. The cost grows with the number of open file descriptors
+/// in this process, including accepted sockets, open files, pipes, and similar
+/// handles.
+///
+/// To avoid that cost on every sample, this source caches the classification of
+/// TCP listeners visible in the current network namespace. While that listener
+/// set is stable, samples do not need a full file descriptor scan and should be
+/// cheap.
+///
+/// # Reliability
+///
+/// Listeners classified as foreign are cached as foreign. If such a listener is
+/// later transferred into this process with `SCM_RIGHTS`, it will not be tracked
+/// while it keeps the same kernel socket identity.
 #[derive(Debug, Clone, bon::Builder)]
 pub struct SocketAcceptQueuesConfig {
     /// Minimum time between samples.
