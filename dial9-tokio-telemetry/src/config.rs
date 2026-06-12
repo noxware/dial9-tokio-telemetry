@@ -379,7 +379,7 @@ struct RuntimeEnvConfig {
     process_resource_usage_enabled: bool,
     process_resource_usage_sample_interval: Option<Duration>,
     socket_accept_queues_enabled: Option<bool>,
-    #[cfg_attr(not(feature = "socket-accept-queues"), allow(dead_code))]
+    #[cfg_attr(not(feature = "linux-socket"), allow(dead_code))]
     socket_accept_queues_sample_interval: Option<Duration>,
 }
 
@@ -623,7 +623,7 @@ fn apply_runtime_env<M>(
         runtime = runtime.with_process_resource_usage(process_resource_usage_config);
     }
 
-    #[cfg(feature = "socket-accept-queues")]
+    #[cfg(feature = "linux-socket")]
     if config.socket_accept_queues_enabled == Some(true) {
         let socket_accept_queues_config = match config.socket_accept_queues_sample_interval {
             Some(interval) => crate::telemetry::SocketAcceptQueuesConfig::builder()
@@ -634,10 +634,10 @@ fn apply_runtime_env<M>(
         runtime = runtime.with_socket_accept_queues(socket_accept_queues_config);
     }
 
-    #[cfg(not(feature = "socket-accept-queues"))]
+    #[cfg(not(feature = "linux-socket"))]
     if config.socket_accept_queues_enabled == Some(true) {
         warn(format_args!(
-            "dial9: socket accept queues requested but `socket-accept-queues` feature is not enabled; ignoring"
+            "dial9: socket accept queues requested but `linux-socket` feature is not enabled; ignoring"
         ));
     }
 
@@ -726,7 +726,7 @@ impl Dial9Config {
     /// | `DIAL9_PROCESS_RESOURCE_USAGE_ENABLED` | `true` on Unix, `false` otherwise | Enable process resource usage sampling from `getrusage(RUSAGE_SELF)`. |
     /// | `DIAL9_PROCESS_RESOURCE_USAGE_SAMPLE_INTERVAL_MS` | `100` | Sampling interval in milliseconds. |
     ///
-    /// Supported socket accept queue variables (`socket-accept-queues` feature required):
+    /// Supported socket accept queue variables (`linux-socket` feature required):
     ///
     /// | Variable | Default | Meaning |
     /// | --- | --- | --- |
@@ -1595,7 +1595,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(target_os = "linux", feature = "socket-accept-queues"))]
+    #[cfg(all(target_os = "linux", feature = "linux-socket"))]
     #[test]
     fn env_config_does_not_enable_socket_accept_queues_by_default() {
         let dir = tempfile::tempdir().expect("temporary trace directory should be created");
@@ -1620,7 +1620,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(target_os = "linux", feature = "socket-accept-queues"))]
+    #[cfg(all(target_os = "linux", feature = "linux-socket"))]
     #[test]
     fn env_config_can_enable_socket_accept_queues() {
         let dir = tempfile::tempdir().expect("temporary trace directory should be created");

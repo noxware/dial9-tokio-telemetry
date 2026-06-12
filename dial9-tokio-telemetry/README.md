@@ -117,7 +117,7 @@ Process resource usage knobs:
 | `DIAL9_PROCESS_RESOURCE_USAGE_ENABLED` | `true` on Unix, `false` otherwise | Enable process resource usage sampling from `getrusage(RUSAGE_SELF)`. |
 | `DIAL9_PROCESS_RESOURCE_USAGE_SAMPLE_INTERVAL_MS` | `100` | Sampling interval in milliseconds. |
 
-Socket accept queue knobs (`socket-accept-queues` feature required, Linux only):
+Socket accept queue knobs (`linux-socket` feature required, Linux only):
 
 | Name | Default | Meaning |
 | --- | --- | --- |
@@ -217,7 +217,7 @@ DIAL9_PROCESS_RESOURCE_USAGE_ENABLED=false
 
 ### Socket accept queues (Linux only)
 
-With the `socket-accept-queues` feature, dial9 can sample TCP listener accept
+With the `linux-socket` feature, dial9 can sample TCP listener accept
 queues from Linux `sock_diag`. Each snapshot records the listener address,
 pending connection count, and backlog limit for sockets owned by the current
 process.

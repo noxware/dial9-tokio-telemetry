@@ -60,7 +60,7 @@ pub struct TracedRuntimeBuilder<P = NoTracePath, M = PipelineUnset, Mode: Writer
     #[cfg(feature = "cpu-profiling")]
     pub(super) sched_event_config: Option<crate::telemetry::cpu_profile::SchedEventConfig>,
     pub(super) process_resource_usage_config: Option<crate::telemetry::ProcessResourceUsageConfig>,
-    #[cfg(feature = "socket-accept-queues")]
+    #[cfg(feature = "linux-socket")]
     pub(super) socket_accept_queues_config: Option<crate::telemetry::SocketAcceptQueuesConfig>,
     pub(super) custom_event_sources: Vec<crate::telemetry::custom_events::CustomEventsSource>,
     pub(super) pipeline: PipelineConfig,
@@ -201,7 +201,7 @@ impl<P, M, Mode: WriterMode> TracedRuntimeBuilder<P, M, Mode> {
     /// Listeners classified as foreign are cached as foreign. If such a listener is
     /// later transferred into this process with `SCM_RIGHTS`, it will not be tracked
     /// while it keeps the same kernel socket identity.
-    #[cfg(feature = "socket-accept-queues")]
+    #[cfg(feature = "linux-socket")]
     pub fn with_socket_accept_queues(
         mut self,
         config: crate::telemetry::SocketAcceptQueuesConfig,
@@ -284,12 +284,12 @@ impl<P, M, Mode: WriterMode> TracedRuntimeBuilder<P, M, Mode> {
             return builder.build();
         };
         let custom_event_sources = self.custom_event_sources;
-        #[cfg(feature = "socket-accept-queues")]
+        #[cfg(feature = "linux-socket")]
         let socket_accept_queues_config = self.socket_accept_queues_config;
 
         if !self.tokio_instrumentation_enabled {
             let runtime = builder.build()?;
-            #[cfg(feature = "socket-accept-queues")]
+            #[cfg(feature = "linux-socket")]
             if let Some(config) = socket_accept_queues_config {
                 push_socket_accept_queues_source(shared, config);
             }
@@ -308,7 +308,7 @@ impl<P, M, Mode: WriterMode> TracedRuntimeBuilder<P, M, Mode> {
             self.task_tracking_enabled,
             self.tokio_hooks,
         )?;
-        #[cfg(feature = "socket-accept-queues")]
+        #[cfg(feature = "linux-socket")]
         if let Some(config) = socket_accept_queues_config {
             push_socket_accept_queues_source(shared, config);
         }
@@ -333,7 +333,7 @@ impl<P, M, Mode: WriterMode> TracedRuntimeBuilder<P, M, Mode> {
             #[cfg(feature = "cpu-profiling")]
             sched_event_config: self.sched_event_config,
             process_resource_usage_config: self.process_resource_usage_config,
-            #[cfg(feature = "socket-accept-queues")]
+            #[cfg(feature = "linux-socket")]
             socket_accept_queues_config: self.socket_accept_queues_config,
             custom_event_sources: self.custom_event_sources,
             pipeline: self.pipeline,
@@ -529,7 +529,7 @@ impl<M, Mode: WriterMode> TracedRuntimeBuilder<HasTracePath, M, Mode> {
             .maybe_task_dump_config(self.task_dump_config)
             .maybe_process_resource_usage(self.process_resource_usage_config);
 
-        #[cfg(feature = "socket-accept-queues")]
+        #[cfg(feature = "linux-socket")]
         let core_builder =
             core_builder.maybe_socket_accept_queues(self.socket_accept_queues_config);
 
@@ -743,7 +743,7 @@ pub(super) fn assemble_processors(
     processors
 }
 
-#[cfg(feature = "socket-accept-queues")]
+#[cfg(feature = "linux-socket")]
 fn push_socket_accept_queues_source(
     shared: &Arc<SharedState>,
     config: crate::telemetry::SocketAcceptQueuesConfig,
@@ -825,7 +825,7 @@ impl TelemetryCore {
         /// Enable process resource usage sampled from `getrusage(RUSAGE_SELF)`.
         process_resource_usage: Option<crate::telemetry::ProcessResourceUsageConfig>,
         /// Enable TCP listener accept queue snapshots sampled from Linux sock_diag.
-        #[cfg(feature = "socket-accept-queues")]
+        #[cfg(feature = "linux-socket")]
         socket_accept_queues: Option<crate::telemetry::SocketAcceptQueuesConfig>,
         /// How often the background worker polls for sealed segments.
         worker_poll_interval: Option<Duration>,
@@ -905,7 +905,7 @@ impl TelemetryCore {
             }
         }
 
-        #[cfg(feature = "socket-accept-queues")]
+        #[cfg(feature = "linux-socket")]
         {
             if let Some(config) = socket_accept_queues {
                 push_socket_accept_queues_source(&shared, config);
@@ -1089,7 +1089,7 @@ impl TracedRuntime {
             #[cfg(feature = "cpu-profiling")]
             sched_event_config: None,
             process_resource_usage_config: None,
-            #[cfg(feature = "socket-accept-queues")]
+            #[cfg(feature = "linux-socket")]
             socket_accept_queues_config: None,
             custom_event_sources: Vec::new(),
             pipeline: PipelineConfig::Unset,

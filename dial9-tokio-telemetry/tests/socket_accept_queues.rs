@@ -1,4 +1,4 @@
-#![cfg(all(target_os = "linux", feature = "socket-accept-queues"))]
+#![cfg(all(target_os = "linux", feature = "linux-socket"))]
 
 mod common;
 
