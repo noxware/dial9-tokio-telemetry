@@ -664,12 +664,24 @@
     }
     const hasTimeFilter = startTime > 0 || endTime < Infinity;
 
-    // Compute timestamp bounds from events (safe for large arrays)
+    // Compute timestamp bounds across all timestamped records that consumers
+    // can inspect directly. CPU samples and custom events may extend slightly
+    // past runtime events, so event-only bounds can make full-range slices drop
+    // otherwise visible records.
     let evMinTs = Infinity, evMaxTs = -Infinity;
-    for (let i = 0; i < events.length; i++) {
-      const t = events[i].timestamp;
+    function includeTimestamp(t) {
+      if (t == null) return;
       if (t < evMinTs) evMinTs = t;
       if (t > evMaxTs) evMaxTs = t;
+    }
+    for (const e of events) includeTimestamp(e.timestamp);
+    for (const s of cpuSamples) includeTimestamp(s.timestamp);
+    for (const e of customEvents) includeTimestamp(e.timestamp);
+    for (const e of allocEvents) includeTimestamp(e.timestamp);
+    for (const e of freeEvents) includeTimestamp(e.timestamp);
+    for (const e of memoryOverflows) includeTimestamp(e.timestamp);
+    for (const dumps of taskDumps.values()) {
+      for (const dump of dumps) includeTimestamp(dump.timestamp);
     }
 
     // Second pass: derive worker attribution from WorkerPark/WorkerUnpark
@@ -682,8 +694,8 @@
       magic: "D9TF",
       version: dec.version,
       events,
-      minTs: events.length > 0 ? evMinTs : null,
-      maxTs: events.length > 0 ? evMaxTs : null,
+      minTs: evMinTs < Infinity ? evMinTs : null,
+      maxTs: evMaxTs > -Infinity ? evMaxTs : null,
       truncated: events.length >= maxEvents,
       timeFiltered: hasTimeFilter,
       filterStartTime: hasTimeFilter ? startTime : null,

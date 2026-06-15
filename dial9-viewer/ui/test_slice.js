@@ -3,6 +3,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const zlib = require("zlib");
 const { assert, testAsync, summarize } = require("./test_harness.js");
 const { sliceTrace } = require("../../dial9-trace-format/js/slice.js");
 const { parseTrace } = require("./trace_parser.js");
@@ -15,6 +16,9 @@ async function main() {
   }
 
   const input = fs.readFileSync(tracePath);
+  const rawInput = input[0] === 0x1f && input[1] === 0x8b
+    ? zlib.gunzipSync(input)
+    : input;
 
   // Parse the full trace for reference
   const full = await parseTrace(input);
@@ -37,7 +41,7 @@ async function main() {
     const sliced = sliceTrace(input, {
       timeRange: { startNs: full.minTs.toString(), endNs: midTs.toString() }
     });
-    assert.ok(sliced.length < input.length, `${sliced.length} should be < ${input.length}`);
+    assert.ok(sliced.length < rawInput.length, `${sliced.length} should be < ${rawInput.length}`);
 
     const parsed = await parseTrace(sliced);
     for (const e of parsed.events) {
