@@ -389,12 +389,7 @@ mod linux {
                     format!("socket receive timeout {timeout:?} exceeds timeval.tv_sec"),
                 )
             })?,
-            tv_usec: timeout.subsec_micros().try_into().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("socket receive timeout {timeout:?} exceeds timeval.tv_usec"),
-                )
-            })?,
+            tv_usec: timeout.subsec_micros().into(),
         };
         let optlen: libc::socklen_t = std::mem::size_of_val(&timeout).try_into().map_err(|_| {
             io::Error::new(
