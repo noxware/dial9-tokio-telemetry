@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Programs using `#[dial9_tokio_telemetry::main]` with the fluent `Dial9Config` now drain the telemetry worker on clean exit (up to the graceful-shutdown deadline, default 1s) instead of exiting immediately. This adds a bounded amount of shutdown latency but ensures the final segment is processed; opt out with `.disable_graceful_shutdown()`. The deprecated positional config is unaffected ([#479](https://github.com/dial9-rs/dial9/issues/479))
 - **Breaking:** renamed `RotatingWriter` to `DiskWriter`. The writer is now generic over its storage backend (`SegmentWriter<Mode>`) with `DiskWriter` / `InMemoryWriter` as the public types; memory constructors are `InMemoryWriter::new` / `::builder` ([#435](https://github.com/dial9-rs/dial9/pull/435))
 - **Breaking:** `SegmentData::segment()` returns `&SegmentRef` (disk- or memory-backed) instead of `&SealedSegment`; processors that read the segment path must match the enum ([#435](https://github.com/dial9-rs/dial9/pull/435))
+- **Breaking:** collapsed the handle types into `Dial9Handle` (record/control, runtime-agnostic) and `Dial9TokioHandle` (spawn only). `TelemetryHandle` and `RuntimeTelemetryHandle` are removed ([#535](https://github.com/dial9-rs/dial9/pull/535))
+- **Breaking:** recording is now a method: `record_event(event, &handle)` becomes `handle.record_event(event)` ([#535](https://github.com/dial9-rs/dial9/pull/535))
+- **Breaking:** `guard.handle()` now returns `Dial9Handle` (record/control). To spawn instrumented tasks use `Dial9TokioHandle::current()`, `guard.tokio_handle(&runtime)`, or the handle from `trace_runtime().build()` ([#535](https://github.com/dial9-rs/dial9/pull/535))
 
 ## [0.3.13](https://github.com/dial9-rs/dial9/compare/dial9-tokio-telemetry-v0.3.12...dial9-tokio-telemetry-v0.3.13) - 2026-05-29
 
