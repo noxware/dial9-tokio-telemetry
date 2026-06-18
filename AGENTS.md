@@ -126,6 +126,14 @@ Failing to update it will cause the viewer to fail when loading the demo.
 
 ## Agent skills
 
+### Trace analysis skills
+
+When analyzing dial9 traces or helping users use the viewer, discover the available trace-analysis skills with:
+
+```bash
+cargo run -p dial9-viewer -- agents
+```
+
 ### Issue tracker
 
 GitHub Issues on `dial9-rs/dial9-tokio-telemetry`. See `docs/agents/issue-tracker.md`.
