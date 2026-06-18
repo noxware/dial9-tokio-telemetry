@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-alpha.2](https://github.com/noxware/dial9-tokio-telemetry/compare/dial9-tokio-telemetry-v0.4.0-alpha.1...dial9-tokio-telemetry-v0.4.0-alpha.2) - 2026-06-18
+
+### Added
+
+- dial9::main now enables graceful_shutdown ([#527](https://github.com/noxware/dial9-tokio-telemetry/pull/527))
+- *(config)* [**breaking**] in-memory support for dial9 main macro ([#490](https://github.com/noxware/dial9-tokio-telemetry/pull/490))
+- [**breaking**] replace `TelemetryEvent` and Rust decode side with new serde-based approach ([#485](https://github.com/noxware/dial9-tokio-telemetry/pull/485))
+- socket accept queues source ([#506](https://github.com/noxware/dial9-tokio-telemetry/pull/506))
+- add dial9-s3-analysis agent skill ([#491](https://github.com/noxware/dial9-tokio-telemetry/pull/491))
+
+### Fixed
+
+- *(analysis)* O(P²) sched-delay scan + idle-vs-blocking off-CPU split ([#508](https://github.com/noxware/dial9-tokio-telemetry/pull/508))
+- merge CPU sample groups by full stack, not just leaf frame ([#484](https://github.com/noxware/dial9-tokio-telemetry/pull/484))
+
+### Other
+
+- [**breaking**] collapse handles into Dial9Handle / Dial9TokioHandle ([#535](https://github.com/noxware/dial9-tokio-telemetry/pull/535))
+- *(config)* Remove legacy positional config ([#538](https://github.com/noxware/dial9-tokio-telemetry/pull/538))
+- Support conventional unit suffixes for viewer ([#516](https://github.com/noxware/dial9-tokio-telemetry/pull/516))
+- Cache the symbolizer across segments ([#462](https://github.com/noxware/dial9-tokio-telemetry/pull/462)) ([#465](https://github.com/noxware/dial9-tokio-telemetry/pull/465))
+- Add dial9-html-report skill: agent-authored HTML trace reports ([#488](https://github.com/noxware/dial9-tokio-telemetry/pull/488))
+- Improve Wire ID Resolution ([#487](https://github.com/noxware/dial9-tokio-telemetry/pull/487))
+- Make trace= viewer param repeatable, ungzipping each component ([#546](https://github.com/noxware/dial9-tokio-telemetry/pull/546))
+- Per-process boot_id namespace isolation for shared trace directories ([#534](https://github.com/noxware/dial9-tokio-telemetry/pull/534))
+- improve s3 browser ([#528](https://github.com/noxware/dial9-tokio-telemetry/pull/528))
+- drop thread_roles from FlushContext / Source ([#539](https://github.com/noxware/dial9-tokio-telemetry/pull/539))
+- Allow for out-of-order tasks and add trace integrity stress test ([#524](https://github.com/noxware/dial9-tokio-telemetry/pull/524))
+- Improve dial9 skills for diagnosing long polls ([#517](https://github.com/noxware/dial9-tokio-telemetry/pull/517))
+- Simplify path handling in dial9-viewer build script ([#518](https://github.com/noxware/dial9-tokio-telemetry/pull/518))
+- build.rs: Generate relative skill includes ([#515](https://github.com/noxware/dial9-tokio-telemetry/pull/515))
+- analysis improvements ([#497](https://github.com/noxware/dial9-tokio-telemetry/pull/497))
+
 ### Added
 
 - In-memory writer (`InMemoryWriter`): run the trace pipeline with no filesystem dependency, encoded segments are held in process memory and shipped by the existing processor pipeline ([#435](https://github.com/dial9-rs/dial9/pull/435))
