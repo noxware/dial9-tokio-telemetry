@@ -1,9 +1,6 @@
 # Agent Guidelines
 
-- You MUST use Red/Green TDD.
-- BEFORE COMMITING: `cargo nextest run --stress-duration 20s`. The package has no flaky tests. If you find a flaky test, you created it.
-- **JS/HTML-only changes** (no `.rs` files touched, no trace format changes): you do NOT need to run the full Rust test suite or the stress test. Run the relevant JS tests under `dial9-viewer/ui/test_*.js` with `node <test>` and a quick `cargo build -p dial9-viewer` to confirm `rust-embed` picks up any new files. Skip `cargo nextest` / stress run.
-- **Adding a new `dial9-viewer/ui/test_*.js` file:** CI does NOT auto-discover JS tests. You MUST register the new file in `scripts/e2e-trace-tests.sh` (the `trace-integrity` CI job runs that script), or it will never run in CI. See `dial9-viewer/ui/README.md`.
+- Prefer Red/Green TDD for non-trivial behavior changes unless the user explicitly requests a different workflow.
 
 ## API Design
 
@@ -77,17 +74,20 @@ Unguarded logging in loops causes log spam that degrades observability and can i
 
 ## Running tests
 
-- Always run `cargo nextest run` to run tests
+- Always run `cargo nextest run` to run tests.
+- For final verification of Rust changes, run `cargo nextest run --stress-duration 20s`. The package is expected to have no flaky tests; report any apparent flake instead of ignoring it.
+- **JS/HTML-only changes** (no `.rs` files touched, no trace format changes): you do NOT need to run the full Rust test suite or the stress test. Run the relevant JS tests under `dial9-viewer/ui/test_*.js` with `node <test>` and a quick `cargo build -p dial9-viewer` to confirm `rust-embed` picks up any new files. Skip `cargo nextest` / stress run.
+- **Adding a new `dial9-viewer/ui/test_*.js` file:** CI does NOT auto-discover JS tests. You MUST register the new file in `scripts/e2e-trace-tests.sh` (the `trace-integrity` CI job runs that script), or it will never run in CI. See `dial9-viewer/ui/README.md`.
 - Shuttle tests are NOT included in `cargo nextest run`. They require a separate invocation: `./scripts/test-shuttle.sh`. Always run this when modifying code under `#[cfg(all(test, shuttle))]` or the flush/source paths.
 
-## Ownership
+## Scope
 
-- You own all code you are working on. There is no such thing as a "pre-existing failure" or something that is "not your problem." If you see a warning or failure, fix it.
+- If you encounter unrelated or pre-existing warnings/failures, report them clearly and ask before fixing. Fix them immediately only when they block the requested work.
 
-## Pre-commit checks
+## Formatting and linting
 
-- You MUST run `cargo fmt --check` and `cargo clippy --all-targets --all-features` before every commit. Both must be clean.
-- **Preserve doc comments and inline comments.** Before presenting a PR, diff your changes and verify you have not accidentally deleted documentation comments (`///`, `//!`), inline explanatory comments (`//`), or module-level docs. Refactors that move code must carry all associated comments with it.
+- For Rust code changes, run `cargo fmt --check` and `cargo clippy --all-targets --all-features`. Report if you did not run them.
+- **Preserve doc comments and inline comments.** When reviewing your diff, verify you have not accidentally deleted documentation comments (`///`, `//!`), inline explanatory comments (`//`), or module-level docs. Refactors that move code must carry all associated comments with it.
 
 ## Demo Trace
 
@@ -110,8 +110,6 @@ rm -f dial9-viewer/ui/demo-trace.bin
 cargo build --release -p metrics-service
 AWS_PROFILE=your-profile cargo run --release -p metrics-service --bin metrics-service -- --trace-path sched-trace.bin --demo
 cp sched-trace.*.bin dial9-viewer/ui/demo-trace.bin
-git add dial9-viewer/ui/demo-trace.bin
-git commit -m "Regenerate demo trace after format changes"
 ```
 
 The demo trace is used for:
@@ -121,14 +119,9 @@ The demo trace is used for:
 
 Failing to update it will cause the viewer to fail when loading the demo.
 
-## Meta
+## Repository management
 
-- Never declare done after pushing or opening a PR until CI is green. Check CI status and fix any failures before moving on.
-- **Do not stack PRs** (PR B targeting PR A's branch). The merge queue rewrites commits, so stacked PRs always end up with merge conflicts. Instead, wait for the first PR to merge, then rebase the second onto `main`.
-
-## Ways of working
-- After finishing your work use showboat to demonstrate what you have done. include key code, tests, and what was changed.
-- Use a progress doc to keep track of what you are doing. progress docs are just for you. when we are ready for PR, we unstage the progress docs
+- Only when explicitly asked to open or manage PRs: do not stack PRs (PR B targeting PR A's branch). The merge queue rewrites commits, so stacked PRs always end up with merge conflicts. Instead, wait for the first PR to merge, then rebase the second onto `main`.
 
 ## Agent skills
 
