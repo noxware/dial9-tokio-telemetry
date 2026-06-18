@@ -1,7 +1,5 @@
 # Agent Guidelines
 
-- Prefer Red/Green TDD for non-trivial behavior changes unless the user explicitly requests a different workflow.
-
 ## API Design
 
 This is a published library with backwards compatibility requirements. Follow
@@ -73,8 +71,9 @@ rate_limited!(Duration::from_secs(60), {
 ```
 Unguarded logging in loops causes log spam that degrades observability and can itself become a performance problem. One-time paths (startup, shutdown, per-thread init) are exempt.
 
-## Running tests
+## Testing
 
+- Behavior changes should include focused tests that fail without the change; if tests are not practical, state why.
 - For Rust behavior changes, run `cargo nextest run`.
 - For final verification of Rust changes, run `cargo nextest run --stress-duration 20s`. The package is expected to have no flaky tests; report any apparent flake instead of ignoring it.
 - **JS/HTML-only changes** (no `.rs` files touched, no trace format changes): you do NOT need to run the full Rust test suite or the stress test. Run the relevant JS tests under `dial9-viewer/ui/test_*.js` with `node <test>` and a quick `cargo build -p dial9-viewer` to confirm `rust-embed` picks up any new files. Skip `cargo nextest` / stress run.
