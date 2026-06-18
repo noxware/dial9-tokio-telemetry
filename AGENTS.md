@@ -54,17 +54,18 @@ the wire (not a compiled-in schema) to decode events.
 
 ## Coding practices
 
-**Never use `unwrap_or(0)`, `unwrap_or_default()`, or similar "fallback to
-zero/sentinel" patterns.** These hide bugs by silently producing plausible but
-wrong values. Always consider the actual error condition: propagate the error,
-return `Option`, log and skip, or panic if the invariant is truly unrecoverable.
+**Do not hide missing data or errors with plausible defaults like `unwrap_or(0)`
+or `unwrap_or_default()`.** Use an explicit semantic default only when it is
+truly valid for the domain, such as an empty collection. Otherwise, handle the
+actual condition: propagate the error, return `Option`, log and skip, or panic if
+the invariant is truly unrecoverable.
 
 Avoid dropping an error without logging it. Use `tracing` for logging.
 ```
 let _ = ...
 ```
 
-**ALWAYS rate-limit logging that can fire from a loop or repeated error path.** Any `warn!`/`error!` reachable from a background task loop, retry loop, or per-request hot path MUST be wrapped in `rate_limited!`:
+**Rate-limit logging that can fire repeatedly from loops or high-volume paths.** Any repeated `warn!`/`error!` reachable from a background task loop, retry loop, or other unbounded error path should be wrapped in `rate_limited!`:
 ```rust
 rate_limited!(Duration::from_secs(60), {
     tracing::warn!("...: {e}");
@@ -74,7 +75,7 @@ Unguarded logging in loops causes log spam that degrades observability and can i
 
 ## Running tests
 
-- Always run `cargo nextest run` to run tests.
+- For Rust behavior changes, run `cargo nextest run`.
 - For final verification of Rust changes, run `cargo nextest run --stress-duration 20s`. The package is expected to have no flaky tests; report any apparent flake instead of ignoring it.
 - **JS/HTML-only changes** (no `.rs` files touched, no trace format changes): you do NOT need to run the full Rust test suite or the stress test. Run the relevant JS tests under `dial9-viewer/ui/test_*.js` with `node <test>` and a quick `cargo build -p dial9-viewer` to confirm `rust-embed` picks up any new files. Skip `cargo nextest` / stress run.
 - **Adding a new `dial9-viewer/ui/test_*.js` file:** CI does NOT auto-discover JS tests. You MUST register the new file in `scripts/e2e-trace-tests.sh` (the `trace-integrity` CI job runs that script), or it will never run in CI. See `dial9-viewer/ui/README.md`.
