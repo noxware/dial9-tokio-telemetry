@@ -910,12 +910,8 @@ impl Dial9Config {
             builder.with_runtime(move |runtime| apply_runtime_env(runtime, runtime_config))
         };
 
-        let config = builder.build_or_disabled();
-        let config = {
-            let mut config = config;
-            config.memory_profiling_config = memory_profiling_config;
-            config
-        };
+        let mut config = builder.build_or_disabled();
+        config.memory_profiling_config = memory_profiling_config;
         config
     }
 }
