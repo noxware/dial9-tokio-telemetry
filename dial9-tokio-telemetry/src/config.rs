@@ -28,8 +28,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(feature = "memory-profiling")]
-use crate::memory_profiling::MemoryProfilingConfig;
 use crate::telemetry::recorder::{
     BuildAndStartRuntime, HasTracePath, PipelineUnset, TelemetryGuard, TracedRuntime,
     TracedRuntimeBuilder,
@@ -37,6 +35,11 @@ use crate::telemetry::recorder::{
 use crate::telemetry::writer::{
     Disk, DiskWriter, InMemoryWriter, Memory, SegmentWriter, WriterMode,
 };
+
+#[cfg(feature = "memory-profiling")]
+type EnvMemoryProfilingConfig = crate::memory_profiling::MemoryProfilingConfig;
+#[cfg(not(feature = "memory-profiling"))]
+type EnvMemoryProfilingConfig = ();
 
 /// Type-erased terminal step: a closure that builds and starts the runtime,
 /// capturing the configured [`TracedRuntimeBuilder`] and its writer at the
@@ -128,8 +131,7 @@ impl std::error::Error for Dial9ConfigBuilderError {
 #[derive(Debug)]
 pub struct Dial9Config {
     pub(crate) inner: Inner,
-    #[cfg(feature = "memory-profiling")]
-    pub(crate) memory_profiling_config: Option<MemoryProfilingConfig>,
+    pub(crate) memory_profiling_config: Option<EnvMemoryProfilingConfig>,
     /// Graceful-shutdown timeout applied by the `#[dial9_tokio_telemetry::main]`
     /// macro after the async body completes. `Some(timeout)` drains the
     /// background worker with that deadline; `None` skips the implicit drain
@@ -712,8 +714,10 @@ fn apply_runtime_env<M>(
 }
 
 #[cfg(feature = "memory-profiling")]
-fn build_memory_profiling_config(config: ResolvedMemoryProfilingConfig) -> MemoryProfilingConfig {
-    MemoryProfilingConfig::builder()
+fn build_memory_profiling_config(
+    config: ResolvedMemoryProfilingConfig,
+) -> crate::memory_profiling::MemoryProfilingConfig {
+    crate::memory_profiling::MemoryProfilingConfig::builder()
         .maybe_sample_rate_bytes(config.sample_rate_bytes)
         .maybe_track_liveset(config.track_liveset)
         .build()
@@ -867,11 +871,14 @@ impl Dial9Config {
         let memory_profiling_config = memory_profiling.map(build_memory_profiling_config);
 
         #[cfg(not(feature = "memory-profiling"))]
-        if memory_profiling.is_some() {
-            warn(format_args!(
-                "dial9: memory profiling requested but `memory-profiling` feature is not enabled; ignoring"
-            ));
-        }
+        let memory_profiling_config = {
+            if memory_profiling.is_some() {
+                warn(format_args!(
+                    "dial9: memory profiling requested but `memory-profiling` feature is not enabled; ignoring"
+                ));
+            }
+            None
+        };
 
         // `from_env` only builds a disk writer for now.
         let builder = Self::builder()
@@ -904,7 +911,6 @@ impl Dial9Config {
         };
 
         let config = builder.build_or_disabled();
-        #[cfg(feature = "memory-profiling")]
         let config = {
             let mut config = config;
             config.memory_profiling_config = memory_profiling_config;
@@ -990,7 +996,6 @@ impl Dial9Config {
                 inner: Inner::Disabled {
                     tokio_configurators,
                 },
-                #[cfg(feature = "memory-profiling")]
                 memory_profiling_config: None,
                 graceful_shutdown_timeout,
             });
@@ -1025,7 +1030,6 @@ impl Dial9Config {
                 tokio_configurators,
                 runtime_builder,
             },
-            #[cfg(feature = "memory-profiling")]
             memory_profiling_config: None,
             graceful_shutdown_timeout,
         })
@@ -1056,7 +1060,6 @@ impl Dial9Config {
                 inner: Inner::Disabled {
                     tokio_configurators,
                 },
-                #[cfg(feature = "memory-profiling")]
                 memory_profiling_config: None,
                 graceful_shutdown_timeout,
             });
@@ -1089,7 +1092,6 @@ impl Dial9Config {
                 tokio_configurators,
                 runtime_builder,
             },
-            #[cfg(feature = "memory-profiling")]
             memory_profiling_config: None,
             graceful_shutdown_timeout,
         })
@@ -1280,7 +1282,6 @@ fn downgrade_on_err(
                 inner: Inner::Disabled {
                     tokio_configurators: fallback,
                 },
-                #[cfg(feature = "memory-profiling")]
                 memory_profiling_config: None,
                 graceful_shutdown_timeout,
             }
@@ -1368,6 +1369,13 @@ mod tests {
                 None => Err(std::env::VarError::NotPresent),
             }
         }
+    }
+
+    fn enabled_env(dir: &tempfile::TempDir) -> FakeEnv {
+        let trace_dir = dir.path().to_str().expect("utf8 tempdir");
+        FakeEnv::default()
+            .with(ENV_DIAL9_ENABLED, "true")
+            .with(ENV_DIAL9_TRACE_DIR, trace_dir)
     }
 
     #[test]
@@ -1533,6 +1541,15 @@ mod tests {
         );
 
         let resolved = resolve_env_config(parse_env_config(
+            &FakeEnv::default().with("DIAL9_MEMORY_PROFILE_ENABLED", "true"),
+        ));
+        let memory = resolved
+            .memory_profiling
+            .expect("memory profiling should be resolved when explicitly enabled");
+        assert_eq!(memory.sample_rate_bytes, None);
+        assert_eq!(memory.track_liveset, None);
+
+        let resolved = resolve_env_config(parse_env_config(
             &FakeEnv::default()
                 .with("DIAL9_MEMORY_PROFILE_ENABLED", "true")
                 .with("DIAL9_MEMORY_SAMPLE_RATE_BYTES", "4096")
@@ -1543,40 +1560,6 @@ mod tests {
             .expect("memory profiling should be resolved when explicitly enabled");
         assert_eq!(memory.sample_rate_bytes, Some(4096));
         assert_eq!(memory.track_liveset, Some(true));
-    }
-
-    #[cfg(feature = "memory-profiling")]
-    #[test]
-    fn env_memory_profiling_builds_config_with_delegated_defaults() {
-        let resolved = resolve_env_config(parse_env_config(
-            &FakeEnv::default().with("DIAL9_MEMORY_PROFILE_ENABLED", "true"),
-        ));
-        let memory = resolved
-            .memory_profiling
-            .expect("memory profiling should be resolved when explicitly enabled");
-        assert_eq!(memory.sample_rate_bytes, None);
-        assert_eq!(memory.track_liveset, None);
-
-        let config = build_memory_profiling_config(memory);
-        assert_eq!(
-            config.sample_rate_bytes(),
-            crate::memory_profiling::DEFAULT_SAMPLE_RATE_BYTES
-        );
-        assert!(!config.track_liveset());
-
-        let resolved = resolve_env_config(parse_env_config(
-            &FakeEnv::default()
-                .with("DIAL9_MEMORY_PROFILE_ENABLED", "true")
-                .with("DIAL9_MEMORY_SAMPLE_RATE_BYTES", "4096")
-                .with("DIAL9_MEMORY_TRACK_LIVESET", "true"),
-        ));
-        let config = build_memory_profiling_config(
-            resolved
-                .memory_profiling
-                .expect("memory profiling should be resolved when explicitly enabled"),
-        );
-        assert_eq!(config.sample_rate_bytes(), 4096);
-        assert!(config.track_liveset());
     }
 
     #[test]
@@ -1685,14 +1668,16 @@ mod tests {
 
     #[cfg(feature = "memory-profiling")]
     #[test]
-    fn env_config_carries_memory_profiling_config_when_enabled() {
+    fn env_config_carries_memory_profiling_overrides_when_requested() {
+        let dir = tempfile::tempdir().expect("tempdir");
         let cfg = Dial9Config::from_env_source(
-            &FakeEnv::default()
+            &enabled_env(&dir)
                 .with("DIAL9_MEMORY_PROFILE_ENABLED", "true")
                 .with("DIAL9_MEMORY_SAMPLE_RATE_BYTES", "4096")
                 .with("DIAL9_MEMORY_TRACK_LIVESET", "true"),
         );
 
+        assert!(matches!(cfg.inner, Inner::Enabled { .. }));
         let memory = cfg
             .memory_profiling_config
             .expect("from_env should carry memory profiling config when requested");
@@ -1703,10 +1688,7 @@ mod tests {
     #[test]
     fn env_config_builds_enabled_with_local_trace_defaults() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let trace_dir = dir.path().to_str().expect("utf8 tempdir");
-        let env = FakeEnv::default()
-            .with("DIAL9_ENABLED", "true")
-            .with("DIAL9_TRACE_DIR", trace_dir);
+        let env = enabled_env(&dir);
 
         let cfg = Dial9Config::from_env_source(&env);
 
@@ -1743,10 +1725,7 @@ mod tests {
     #[test]
     fn env_config_applies_runtime_name_and_task_dumps() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let trace_dir = dir.path().to_str().expect("utf8 tempdir");
-        let env = FakeEnv::default()
-            .with("DIAL9_ENABLED", "true")
-            .with("DIAL9_TRACE_DIR", trace_dir)
+        let env = enabled_env(&dir)
             .with("DIAL9_RUNTIME_NAME", " api-runtime ")
             .with("DIAL9_TASK_DUMP_ENABLED", "true")
             .with("DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS", "25");
@@ -1782,13 +1761,7 @@ mod tests {
     #[test]
     fn env_config_enables_process_resource_usage_by_default_on_unix() {
         let dir = tempfile::tempdir().expect("temporary trace directory should be created");
-        let trace_dir = dir
-            .path()
-            .to_str()
-            .expect("temporary trace directory path should be valid UTF-8");
-        let env = FakeEnv::default()
-            .with("DIAL9_ENABLED", "true")
-            .with("DIAL9_TRACE_DIR", trace_dir);
+        let env = enabled_env(&dir);
 
         let cfg = Dial9Config::from_env_source(&env);
         let rt = TracedRuntime::try_new(cfg).expect("runtime should build");
@@ -1807,14 +1780,7 @@ mod tests {
     #[test]
     fn env_config_can_disable_process_resource_usage() {
         let dir = tempfile::tempdir().expect("temporary trace directory should be created");
-        let trace_dir = dir
-            .path()
-            .to_str()
-            .expect("temporary trace directory path should be valid UTF-8");
-        let env = FakeEnv::default()
-            .with("DIAL9_ENABLED", "true")
-            .with("DIAL9_TRACE_DIR", trace_dir)
-            .with("DIAL9_PROCESS_RESOURCE_USAGE_ENABLED", "false");
+        let env = enabled_env(&dir).with("DIAL9_PROCESS_RESOURCE_USAGE_ENABLED", "false");
 
         let cfg = Dial9Config::from_env_source(&env);
         let rt = TracedRuntime::try_new(cfg).expect("runtime should build");
@@ -1833,13 +1799,7 @@ mod tests {
     #[test]
     fn env_config_does_not_enable_socket_accept_queues_by_default() {
         let dir = tempfile::tempdir().expect("temporary trace directory should be created");
-        let trace_dir = dir
-            .path()
-            .to_str()
-            .expect("temporary trace directory path should be valid UTF-8");
-        let env = FakeEnv::default()
-            .with("DIAL9_ENABLED", "true")
-            .with("DIAL9_TRACE_DIR", trace_dir);
+        let env = enabled_env(&dir);
 
         let cfg = Dial9Config::from_env_source(&env);
         let rt = TracedRuntime::try_new(cfg).expect("runtime should build");
@@ -1858,14 +1818,7 @@ mod tests {
     #[test]
     fn env_config_can_enable_socket_accept_queues() {
         let dir = tempfile::tempdir().expect("temporary trace directory should be created");
-        let trace_dir = dir
-            .path()
-            .to_str()
-            .expect("temporary trace directory path should be valid UTF-8");
-        let env = FakeEnv::default()
-            .with("DIAL9_ENABLED", "true")
-            .with("DIAL9_TRACE_DIR", trace_dir)
-            .with("DIAL9_SOCKET_ACCEPT_QUEUES_ENABLED", "true");
+        let env = enabled_env(&dir).with("DIAL9_SOCKET_ACCEPT_QUEUES_ENABLED", "true");
 
         let cfg = Dial9Config::from_env_source(&env);
         let rt = TracedRuntime::try_new(cfg).expect("runtime should build");
@@ -1883,11 +1836,7 @@ mod tests {
     #[test]
     fn env_config_can_disable_tokio_instrumentation_without_disabling_telemetry() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let trace_dir = dir.path().to_str().expect("utf8 tempdir");
-        let env = FakeEnv::default()
-            .with("DIAL9_ENABLED", "true")
-            .with("DIAL9_TRACE_DIR", trace_dir)
-            .with("DIAL9_TOKIO_INSTRUMENTATION_ENABLED", "false");
+        let env = enabled_env(&dir).with("DIAL9_TOKIO_INSTRUMENTATION_ENABLED", "false");
 
         let cfg = Dial9Config::from_env_source(&env);
         let rt = TracedRuntime::try_new(cfg).expect("runtime should build");
