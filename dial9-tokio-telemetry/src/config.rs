@@ -28,6 +28,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(feature = "memory-profiling")]
+use crate::memory_profiling::MemoryProfilingConfig;
 use crate::telemetry::recorder::{
     BuildAndStartRuntime, HasTracePath, PipelineUnset, TelemetryGuard, TracedRuntime,
     TracedRuntimeBuilder,
@@ -126,6 +128,8 @@ impl std::error::Error for Dial9ConfigBuilderError {
 #[derive(Debug)]
 pub struct Dial9Config {
     pub(crate) inner: Inner,
+    #[cfg(feature = "memory-profiling")]
+    pub(crate) memory_profiling_config: Option<MemoryProfilingConfig>,
     /// Graceful-shutdown timeout applied by the `#[dial9_tokio_telemetry::main]`
     /// macro after the async body completes. `Some(timeout)` drains the
     /// background worker with that deadline; `None` skips the implicit drain
@@ -242,6 +246,9 @@ const ENV_DIAL9_S3_PREFIX: &str = "DIAL9_S3_PREFIX";
 const ENV_DIAL9_CPU_PROFILE_ENABLED: &str = "DIAL9_CPU_PROFILE_ENABLED";
 const ENV_DIAL9_CPU_SAMPLE_HZ: &str = "DIAL9_CPU_SAMPLE_HZ";
 const ENV_DIAL9_SCHEDULE_PROFILE_ENABLED: &str = "DIAL9_SCHEDULE_PROFILE_ENABLED";
+const ENV_DIAL9_MEMORY_PROFILE_ENABLED: &str = "DIAL9_MEMORY_PROFILE_ENABLED";
+const ENV_DIAL9_MEMORY_SAMPLE_RATE_BYTES: &str = "DIAL9_MEMORY_SAMPLE_RATE_BYTES";
+const ENV_DIAL9_MEMORY_TRACK_LIVESET: &str = "DIAL9_MEMORY_TRACK_LIVESET";
 const ENV_DIAL9_TASK_DUMP_ENABLED: &str = "DIAL9_TASK_DUMP_ENABLED";
 const ENV_DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS: &str = "DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS";
 const ENV_DIAL9_PROCESS_RESOURCE_USAGE_ENABLED: &str = "DIAL9_PROCESS_RESOURCE_USAGE_ENABLED";
@@ -261,6 +268,7 @@ const DEFAULT_GC_DEAD_NAMESPACES: bool = true;
 const DEFAULT_CPU_PROFILE_ENABLED: bool = cfg!(all(target_os = "linux", feature = "cpu-profiling"));
 const DEFAULT_SCHEDULE_PROFILE_ENABLED: bool =
     cfg!(all(target_os = "linux", feature = "cpu-profiling"));
+const DEFAULT_MEMORY_PROFILE_ENABLED: bool = false;
 const DEFAULT_TASK_DUMP_ENABLED: bool = false;
 const DEFAULT_PROCESS_RESOURCE_USAGE_ENABLED: bool = cfg!(unix);
 
@@ -298,6 +306,9 @@ struct ParsedEnvConfig {
     cpu_profile_enabled: Option<bool>,
     cpu_sample_hz: Option<u64>,
     schedule_profile_enabled: Option<bool>,
+    memory_profile_enabled: Option<bool>,
+    memory_sample_rate_bytes: Option<u64>,
+    memory_track_liveset: Option<bool>,
     task_dump_enabled: Option<bool>,
     task_dump_idle_threshold: Option<Duration>,
     process_resource_usage_enabled: Option<bool>,
@@ -321,6 +332,15 @@ struct ResolvedS3Config {
     bucket: String,
     service_name: Option<String>,
     prefix: String,
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(feature = "memory-profiling"), allow(dead_code))]
+struct ResolvedMemoryProfilingConfig {
+    // None means MemoryProfilingConfig::default() owns the sample rate.
+    sample_rate_bytes: Option<u64>,
+    // None means MemoryProfilingConfig::default() owns the liveset setting.
+    track_liveset: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -352,6 +372,10 @@ struct ResolvedEnvConfig {
     cpu_sample_hz: Option<u64>,
 
     schedule_profile_enabled: bool,
+
+    // Optional source: Some(_) installs memory profiling; None leaves it disabled.
+    memory_profiling: Option<ResolvedMemoryProfilingConfig>,
+
     task_dump_enabled: bool,
 
     // None means TaskDumpConfig::default() owns the idle threshold.
@@ -420,6 +444,9 @@ fn parse_env_config(env: &impl EnvSource) -> ParsedEnvConfig {
         cpu_profile_enabled: env.get_bool(ENV_DIAL9_CPU_PROFILE_ENABLED),
         cpu_sample_hz: env.get_positive_u64(ENV_DIAL9_CPU_SAMPLE_HZ),
         schedule_profile_enabled: env.get_bool(ENV_DIAL9_SCHEDULE_PROFILE_ENABLED),
+        memory_profile_enabled: env.get_bool(ENV_DIAL9_MEMORY_PROFILE_ENABLED),
+        memory_sample_rate_bytes: env.get_positive_u64(ENV_DIAL9_MEMORY_SAMPLE_RATE_BYTES),
+        memory_track_liveset: env.get_bool(ENV_DIAL9_MEMORY_TRACK_LIVESET),
         task_dump_enabled: env.get_bool(ENV_DIAL9_TASK_DUMP_ENABLED),
         task_dump_idle_threshold: env
             .get_positive_u64(ENV_DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS)
@@ -440,6 +467,13 @@ fn resolve_env_config(parsed: ParsedEnvConfig) -> ResolvedEnvConfig {
     let max_total_size = parsed
         .max_total_size
         .unwrap_or_else(|| DEFAULT_MAX_DISK_USAGE_MB.saturating_mul(BYTES_PER_MIB));
+    let memory_profiling = parsed
+        .memory_profile_enabled
+        .unwrap_or(DEFAULT_MEMORY_PROFILE_ENABLED)
+        .then_some(ResolvedMemoryProfilingConfig {
+            sample_rate_bytes: parsed.memory_sample_rate_bytes,
+            track_liveset: parsed.memory_track_liveset,
+        });
 
     ResolvedEnvConfig {
         enabled: parsed.enabled.unwrap_or(DEFAULT_ENABLED),
@@ -466,6 +500,7 @@ fn resolve_env_config(parsed: ParsedEnvConfig) -> ResolvedEnvConfig {
         schedule_profile_enabled: parsed
             .schedule_profile_enabled
             .unwrap_or(DEFAULT_SCHEDULE_PROFILE_ENABLED),
+        memory_profiling,
         task_dump_enabled: parsed
             .task_dump_enabled
             .unwrap_or(DEFAULT_TASK_DUMP_ENABLED),
@@ -676,6 +711,14 @@ fn apply_runtime_env<M>(
     runtime
 }
 
+#[cfg(feature = "memory-profiling")]
+fn build_memory_profiling_config(config: ResolvedMemoryProfilingConfig) -> MemoryProfilingConfig {
+    MemoryProfilingConfig::builder()
+        .maybe_sample_rate_bytes(config.sample_rate_bytes)
+        .maybe_track_liveset(config.track_liveset)
+        .build()
+}
+
 #[cfg(feature = "worker-s3")]
 fn build_s3_config(config: ResolvedS3Config) -> crate::background_task::s3::S3Config {
     crate::background_task::s3::S3Config::builder()
@@ -740,6 +783,16 @@ impl Dial9Config {
     /// | `DIAL9_CPU_SAMPLE_HZ` | `99` | CPU sampling frequency in Hz. |
     /// | `DIAL9_SCHEDULE_PROFILE_ENABLED` | `true` on Linux with `cpu-profiling`, `false` otherwise | Enable per-worker scheduler event capture. Requires the [CPU profiling setup](https://github.com/dial9-rs/dial9/blob/HEAD/dial9-tokio-telemetry/README.md#cpu-profiling-linux-only). |
     ///
+    /// Supported memory profiling variables (`memory-profiling` feature required;
+    /// applications must still install [`Dial9Allocator`](crate::memory_profiling::Dial9Allocator)
+    /// as their `#[global_allocator]`):
+    ///
+    /// | Variable | Default | Meaning |
+    /// | --- | --- | --- |
+    /// | `DIAL9_MEMORY_PROFILE_ENABLED` | `false` | Enable memory allocation sampling. |
+    /// | `DIAL9_MEMORY_SAMPLE_RATE_BYTES` | `524288` | Mean bytes between sampled allocations. |
+    /// | `DIAL9_MEMORY_TRACK_LIVESET` | `false` | Track frees for leak detection. |
+    ///
     /// Supported process resource usage variables:
     ///
     /// | Variable | Default | Meaning |
@@ -785,6 +838,7 @@ impl Dial9Config {
             cpu_profile_enabled,
             cpu_sample_hz,
             schedule_profile_enabled,
+            memory_profiling,
             task_dump_enabled,
             task_dump_idle_threshold,
             process_resource_usage_enabled,
@@ -808,6 +862,16 @@ impl Dial9Config {
             socket_accept_queues_enabled,
             socket_accept_queues_sample_interval,
         };
+
+        #[cfg(feature = "memory-profiling")]
+        let memory_profiling_config = memory_profiling.map(build_memory_profiling_config);
+
+        #[cfg(not(feature = "memory-profiling"))]
+        if memory_profiling.is_some() {
+            warn(format_args!(
+                "dial9: memory profiling requested but `memory-profiling` feature is not enabled; ignoring"
+            ));
+        }
 
         // `from_env` only builds a disk writer for now.
         let builder = Self::builder()
@@ -839,7 +903,14 @@ impl Dial9Config {
             builder.with_runtime(move |runtime| apply_runtime_env(runtime, runtime_config))
         };
 
-        builder.build_or_disabled()
+        let config = builder.build_or_disabled();
+        #[cfg(feature = "memory-profiling")]
+        let config = {
+            let mut config = config;
+            config.memory_profiling_config = memory_profiling_config;
+            config
+        };
+        config
     }
 }
 
@@ -919,6 +990,8 @@ impl Dial9Config {
                 inner: Inner::Disabled {
                     tokio_configurators,
                 },
+                #[cfg(feature = "memory-profiling")]
+                memory_profiling_config: None,
                 graceful_shutdown_timeout,
             });
         }
@@ -952,6 +1025,8 @@ impl Dial9Config {
                 tokio_configurators,
                 runtime_builder,
             },
+            #[cfg(feature = "memory-profiling")]
+            memory_profiling_config: None,
             graceful_shutdown_timeout,
         })
     }
@@ -981,6 +1056,8 @@ impl Dial9Config {
                 inner: Inner::Disabled {
                     tokio_configurators,
                 },
+                #[cfg(feature = "memory-profiling")]
+                memory_profiling_config: None,
                 graceful_shutdown_timeout,
             });
         }
@@ -1012,6 +1089,8 @@ impl Dial9Config {
                 tokio_configurators,
                 runtime_builder,
             },
+            #[cfg(feature = "memory-profiling")]
+            memory_profiling_config: None,
             graceful_shutdown_timeout,
         })
     }
@@ -1201,6 +1280,8 @@ fn downgrade_on_err(
                 inner: Inner::Disabled {
                     tokio_configurators: fallback,
                 },
+                #[cfg(feature = "memory-profiling")]
+                memory_profiling_config: None,
                 graceful_shutdown_timeout,
             }
         }
@@ -1305,6 +1386,9 @@ mod tests {
         assert_eq!(parsed.cpu_profile_enabled, None);
         assert_eq!(parsed.cpu_sample_hz, None);
         assert_eq!(parsed.schedule_profile_enabled, None);
+        assert_eq!(parsed.memory_profile_enabled, None);
+        assert_eq!(parsed.memory_sample_rate_bytes, None);
+        assert_eq!(parsed.memory_track_liveset, None);
         assert_eq!(parsed.task_dump_enabled, None);
         assert_eq!(parsed.task_dump_idle_threshold, None);
         assert_eq!(parsed.process_resource_usage_enabled, None);
@@ -1342,6 +1426,7 @@ mod tests {
         assert_eq!(resolved.tokio_instrumentation_enabled, None);
         assert_eq!(resolved.cpu_profile_enabled, supported_profiling);
         assert_eq!(resolved.schedule_profile_enabled, supported_profiling);
+        assert!(resolved.memory_profiling.is_none());
         assert_eq!(resolved.task_dump_enabled, DEFAULT_TASK_DUMP_ENABLED);
         assert_eq!(
             resolved.process_resource_usage_enabled,
@@ -1393,6 +1478,9 @@ mod tests {
                 .with("DIAL9_CPU_PROFILE_ENABLED", "false")
                 .with("DIAL9_CPU_SAMPLE_HZ", "199")
                 .with("DIAL9_SCHEDULE_PROFILE_ENABLED", "false")
+                .with("DIAL9_MEMORY_PROFILE_ENABLED", "true")
+                .with("DIAL9_MEMORY_SAMPLE_RATE_BYTES", "4096")
+                .with("DIAL9_MEMORY_TRACK_LIVESET", "true")
                 .with("DIAL9_TASK_DUMP_ENABLED", "true")
                 .with("DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS", "25")
                 .with("DIAL9_PROCESS_RESOURCE_USAGE_ENABLED", "true")
@@ -1412,6 +1500,9 @@ mod tests {
         assert_eq!(parsed.cpu_profile_enabled, Some(false));
         assert_eq!(parsed.cpu_sample_hz, Some(199));
         assert_eq!(parsed.schedule_profile_enabled, Some(false));
+        assert_eq!(parsed.memory_profile_enabled, Some(true));
+        assert_eq!(parsed.memory_sample_rate_bytes, Some(4096));
+        assert_eq!(parsed.memory_track_liveset, Some(true));
         assert_eq!(parsed.task_dump_enabled, Some(true));
         assert_eq!(
             parsed.task_dump_idle_threshold,
@@ -1427,6 +1518,65 @@ mod tests {
             parsed.socket_accept_queues_sample_interval,
             Some(Duration::from_millis(1000))
         );
+    }
+
+    #[test]
+    fn env_memory_profiling_resolves_only_when_enabled() {
+        let resolved = resolve_env_config(parse_env_config(
+            &FakeEnv::default()
+                .with("DIAL9_MEMORY_SAMPLE_RATE_BYTES", "4096")
+                .with("DIAL9_MEMORY_TRACK_LIVESET", "true"),
+        ));
+        assert!(
+            resolved.memory_profiling.is_none(),
+            "memory profiling tuning alone should not enable the source"
+        );
+
+        let resolved = resolve_env_config(parse_env_config(
+            &FakeEnv::default()
+                .with("DIAL9_MEMORY_PROFILE_ENABLED", "true")
+                .with("DIAL9_MEMORY_SAMPLE_RATE_BYTES", "4096")
+                .with("DIAL9_MEMORY_TRACK_LIVESET", "true"),
+        ));
+        let memory = resolved
+            .memory_profiling
+            .expect("memory profiling should be resolved when explicitly enabled");
+        assert_eq!(memory.sample_rate_bytes, Some(4096));
+        assert_eq!(memory.track_liveset, Some(true));
+    }
+
+    #[cfg(feature = "memory-profiling")]
+    #[test]
+    fn env_memory_profiling_builds_config_with_delegated_defaults() {
+        let resolved = resolve_env_config(parse_env_config(
+            &FakeEnv::default().with("DIAL9_MEMORY_PROFILE_ENABLED", "true"),
+        ));
+        let memory = resolved
+            .memory_profiling
+            .expect("memory profiling should be resolved when explicitly enabled");
+        assert_eq!(memory.sample_rate_bytes, None);
+        assert_eq!(memory.track_liveset, None);
+
+        let config = build_memory_profiling_config(memory);
+        assert_eq!(
+            config.sample_rate_bytes(),
+            crate::memory_profiling::DEFAULT_SAMPLE_RATE_BYTES
+        );
+        assert!(!config.track_liveset());
+
+        let resolved = resolve_env_config(parse_env_config(
+            &FakeEnv::default()
+                .with("DIAL9_MEMORY_PROFILE_ENABLED", "true")
+                .with("DIAL9_MEMORY_SAMPLE_RATE_BYTES", "4096")
+                .with("DIAL9_MEMORY_TRACK_LIVESET", "true"),
+        ));
+        let config = build_memory_profiling_config(
+            resolved
+                .memory_profiling
+                .expect("memory profiling should be resolved when explicitly enabled"),
+        );
+        assert_eq!(config.sample_rate_bytes(), 4096);
+        assert!(config.track_liveset());
     }
 
     #[test]
@@ -1485,6 +1635,9 @@ mod tests {
                 .with("DIAL9_RUNTIME_NAME", "   ")
                 .with("DIAL9_S3_BUCKET", "   ")
                 .with("DIAL9_CPU_SAMPLE_HZ", "0")
+                .with("DIAL9_MEMORY_PROFILE_ENABLED", "maybe")
+                .with("DIAL9_MEMORY_SAMPLE_RATE_BYTES", "0")
+                .with("DIAL9_MEMORY_TRACK_LIVESET", "maybe")
                 .with("DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS", "wat")
                 .with("DIAL9_PROCESS_RESOURCE_USAGE_ENABLED", "maybe")
                 .with("DIAL9_PROCESS_RESOURCE_USAGE_SAMPLE_INTERVAL_MS", "0")
@@ -1501,6 +1654,9 @@ mod tests {
         assert_eq!(parsed.runtime_name, None);
         assert!(parsed.s3.is_none());
         assert_eq!(parsed.cpu_sample_hz, None);
+        assert_eq!(parsed.memory_profile_enabled, None);
+        assert_eq!(parsed.memory_sample_rate_bytes, None);
+        assert_eq!(parsed.memory_track_liveset, None);
         assert_eq!(parsed.task_dump_idle_threshold, None);
         assert_eq!(parsed.process_resource_usage_enabled, None);
         assert_eq!(parsed.process_resource_usage_sample_interval, None);
@@ -1525,6 +1681,23 @@ mod tests {
         let cfg = Dial9Config::from_env_source(&FakeEnv::default());
 
         assert!(matches!(cfg.inner, Inner::Disabled { .. }));
+    }
+
+    #[cfg(feature = "memory-profiling")]
+    #[test]
+    fn env_config_carries_memory_profiling_config_when_enabled() {
+        let cfg = Dial9Config::from_env_source(
+            &FakeEnv::default()
+                .with("DIAL9_MEMORY_PROFILE_ENABLED", "true")
+                .with("DIAL9_MEMORY_SAMPLE_RATE_BYTES", "4096")
+                .with("DIAL9_MEMORY_TRACK_LIVESET", "true"),
+        );
+
+        let memory = cfg
+            .memory_profiling_config
+            .expect("from_env should carry memory profiling config when requested");
+        assert_eq!(memory.sample_rate_bytes(), 4096);
+        assert!(memory.track_liveset());
     }
 
     #[test]
