@@ -3105,10 +3105,9 @@
                 }
 
                 const avgPct = capacity != null ? Math.min(100, (stats.avgCores / capacity) * 100) : null;
-                const capText = capacity != null ? `cap ${fmtCpuCores(capacity)}` : "cap unknown";
                 const pctText = avgPct != null ? ` · avg ${fmtCpuPercent(avgPct)}` : "";
                 document.getElementById("cpu-panel-info").textContent =
-                    `${stats.visibleIntervals} intervals · avg ${fmtCpuCores(stats.avgCores)} cores${pctText} · max ${fmtCpuCores(stats.maxCores)} · ${capText}`;
+                    `${stats.visibleIntervals} intervals · avg ${fmtCpuCores(stats.avgCores)} cores${pctText} · max ${fmtCpuCores(stats.maxCores)}`;
             }
 
             function findProcessCpuIntervalAt(ns) {
@@ -3126,19 +3125,12 @@
 
             function cpuIntervalTooltipHtml(interval) {
                 const capacity = processCpuUsage.availableParallelism;
-                let html = `<span class="label">CPU interval:</span> <span class="value">${fmtTs(interval.start)}</span> – <span class="value">${fmtTs(interval.end)}</span>`;
-                html += `<br><span class="label">Window:</span> <span class="value">${formatHumanDuration(interval.wallDeltaNs)}</span>`;
+                let html = `<span class="label">Window:</span> <span class="value">${formatHumanDuration(interval.wallDeltaNs)}</span>`;
                 html += `<br><span class="label">CPU time:</span> <span class="value">${formatHumanDuration(interval.cpuDeltaNs)}</span>`;
-                html += ` <span style="color:#888">user ${formatHumanDuration(interval.userDeltaNs)} + system ${formatHumanDuration(interval.systemDeltaNs)}</span>`;
                 html += `<br><span class="label">Cores:</span> <span class="value">${fmtCpuCores(interval.cores)}</span>`;
                 if (capacity != null) {
-                    html += ` · <span class="label">Total CPU:</span> <span class="value">${fmtCpuPercent(interval.totalPercent)}</span>`;
-                    html += `<br><span class="label">available_parallelism:</span> <span class="value">${fmtCpuCores(capacity)}</span>`;
-                } else {
-                    html += `<br><span class="label">available_parallelism:</span> <span class="value">unknown</span>`;
+                    html += `<br><span class="label">Total CPU:</span> <span class="value">${fmtCpuPercent(interval.totalPercent)}</span>`;
                 }
-                html += `<br><span class="label">Sample A cpu time:</span> <span class="value">${formatHumanDuration(interval.startCpuTimeNs)}</span>`;
-                html += `<br><span class="label">Sample B cpu time:</span> <span class="value">${formatHumanDuration(interval.endCpuTimeNs)}</span>`;
                 return html;
             }
 
