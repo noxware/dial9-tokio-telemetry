@@ -171,6 +171,7 @@
    *   callframeSymbols: Map<string, SymbolFrame|SymbolFrame[]>,
    *   threadNames: Map<number, string>,
    *   runtimeWorkers: Map<string, number[]>,
+   *   segmentMetadata: Map<string, string>,
    * }} ParsedTrace
    */
 
@@ -404,6 +405,7 @@
     const threadNames = new Map();
     const tidToWorker = new Map(); // tid → workerId (stable mapping from park/unpark events)
     const runtimeWorkers = new Map(); // runtime name → [workerId, ...]
+    const segmentMetadata = new Map(); // latest segment metadata key → value
     const taskDumps = new Map(); // taskId → [{timestamp, callchain}] sorted by timestamp
     const customEvents = []; // unrecognized event types: {name, timestamp, fields}
     // { monotonicNs, realtimeNs } anchors used to recover wall clock.
@@ -668,9 +670,11 @@
           }
           const entries = v.entries || {};
           for (const [key, val] of Object.entries(entries)) {
+            const value = String(val);
+            segmentMetadata.set(key, value);
             if (key.startsWith("runtime.")) {
               const name = key.slice("runtime.".length);
-              const ids = val
+              const ids = value
                 .split(",")
                 .map(Number)
                 .filter((n) => !isNaN(n));
@@ -799,6 +803,7 @@
       tidToWorker,
       taskTerminateTimes,
       runtimeWorkers,
+      segmentMetadata,
       customEvents,
       taskDumps,
       clockSyncAnchors,
@@ -852,6 +857,7 @@
           if (raw.callframeSymbols) raw.callframeSymbols = entriesToMap(raw.callframeSymbols);
           if (raw.threadNames) raw.threadNames = entriesToMap(raw.threadNames);
           if (raw.runtimeWorkers) raw.runtimeWorkers = entriesToMap(raw.runtimeWorkers);
+          if (raw.segmentMetadata) raw.segmentMetadata = entriesToMap(raw.segmentMetadata);
           if (raw.taskDumps) raw.taskDumps = entriesToMap(raw.taskDumps);
           break;
         case 'e': events.push(rec.d); break;
@@ -864,6 +870,7 @@
     }
     raw.events = events;
     raw.cpuSamples = cpuSamples;
+    if (!raw.segmentMetadata) raw.segmentMetadata = new Map();
     raw.customEvents = customEvents;
     raw.allocEvents = allocEvents;
     raw.freeEvents = freeEvents;
