@@ -569,6 +569,28 @@
                 height: 100%;
                 display: block;
             }
+            #cpu-panel {
+                display: none;
+                height: 92px;
+                background: #111b2e;
+                border-top: 1px solid #333;
+                flex-shrink: 0;
+                position: relative;
+                overflow: hidden;
+            }
+            #cpu-panel .chart-label {
+                position: absolute;
+                top: 4px;
+                left: 8px;
+                font-size: 0.75em;
+                color: #888;
+                z-index: 2;
+            }
+            #cpu-panel canvas {
+                width: 100%;
+                height: 100%;
+                display: block;
+            }
             #task-detail .chart-label {
                 position: absolute;
                 top: 4px;
@@ -843,6 +865,11 @@
                     <span id="ce-panel-info" style="position:absolute;top:4px;right:12px;font-size:0.75em;color:#aaa;z-index:2;pointer-events:none"></span>
                     <canvas id="ce-panel-canvas"></canvas>
                 </div>
+                <div id="cpu-panel" style="display:none">
+                    <div class="chart-label" id="cpu-panel-label">CPU Usage</div>
+                    <span id="cpu-panel-info" style="position:absolute;top:4px;right:12px;font-size:0.75em;color:#aaa;z-index:2;pointer-events:none"></span>
+                    <canvas id="cpu-panel-canvas"></canvas>
+                </div>
                 <div id="task-detail">
                     <span class="chart-label" id="task-detail-label">Task Detail</span>
                     <span id="task-detail-status" style="position:absolute;top:4px;right:12px;font-size:0.75em;color:#aaa;z-index:2"></span>
@@ -919,7 +946,7 @@
         <script src="panel_layout.js"></script>
         <script>
             const { EVENT_TYPES: ET, parseTrace, formatFrame, symbolizeChain, deduplicateSamples } = TraceParser;
-            const { buildWorkerSpans, attachCpuSamples, buildActiveTaskTimeline, computeSchedulingDelays, filterPointsOfInterest, buildSpanData, collectDescendants, selectSpanRenderSet, enclosingSpans, computeSpanLayout, getTraceTimeRange, hasCpuProfileSamples } = TraceAnalysis;
+            const { buildWorkerSpans, attachCpuSamples, buildActiveTaskTimeline, computeSchedulingDelays, filterPointsOfInterest, buildSpanData, collectDescendants, selectSpanRenderSet, enclosingSpans, computeSpanLayout, getTraceTimeRange, hasCpuProfileSamples, buildProcessCpuUsageSeries } = TraceAnalysis;
 
             function esc(s) {
                 return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -1168,6 +1195,13 @@
             // Per-worker local queue samples
             let workerQueueSamples = {};
             let maxLocalQueue = 1;
+            let processCpuUsage = {
+                samples: [],
+                intervals: [],
+                availableParallelism: null,
+                maxCores: 0,
+                avgCores: 0,
+            };
             // Points of interest for navigation
             let pointsOfInterest = [];
             let currentPoiIndex = -1;
@@ -1196,6 +1230,7 @@
             // Timestamp of the custom event currently hovered, for a transient
             // guide line across the lanes. Drawn on the crosshair overlay.
             let hoverEventTs = null;
+            let hoverCpuInterval = null;
             let selectedSpanId = null; // when a span bar is clicked, highlight all polls containing this span
             let selectedSpanIds = new Set(); // includes selected span + parent chain
             // Active task count timeline: [{t, count}]
@@ -1247,6 +1282,7 @@
             //   • Timeline header  (renderTimeline)
             //   • Worker lanes     (renderLane)           — uses DOM flex instead of canvas offset
             //   • Span panel       (renderSpanPanel)
+            //   • CPU panel        (renderProcessCpuPanel)
             //   • Task detail      (renderTaskDetail)
             //   • Queue chart      (renderQueueChart)
             //
@@ -1356,8 +1392,11 @@
                 relatedExpand = {};
                 relatedItems = [];
                 hoveredWakerTaskId = null;
+                hoverCpuInterval = null;
+                processCpuUsage = { samples: [], intervals: [], availableParallelism: null, maxCores: 0, avgCores: 0 };
                 hideStackPopup();
                 taskDetailPanel.style.display = "none";
+                document.getElementById("cpu-panel").style.display = "none";
                 schedPanelTimeRange = null;
 
                 // Default: clear the URL range only when replacing a visible
@@ -1549,9 +1588,9 @@
 
             function processTrace() {
                 const evts = trace.events;
-                const timeRange = getTraceTimeRange(evts, trace.cpuSamples);
+                const timeRange = getTraceTimeRange(evts, trace.cpuSamples, trace.customEvents);
                 if (!timeRange) {
-                    alert("No runtime events or CPU profile samples in trace");
+                    alert("No runtime events, CPU profile samples, or process resource usage samples in trace");
                     return false;
                 }
 
@@ -1602,6 +1641,17 @@
 
                 schedDelays = computeSchedulingDelays(workerSpans, workerIds, wakesByTask);
                 console.log(`Found ${Object.keys(wakesByTask).length} tasks with wake events, ${schedDelays.length} scheduling delays`);
+
+                const availableParallelism = trace.segmentMetadata?.get("process.available_parallelism") ?? null;
+                processCpuUsage = buildProcessCpuUsageSeries(trace.customEvents || [], availableParallelism);
+                const cpuPanel = document.getElementById("cpu-panel");
+                cpuPanel.style.display = processCpuUsage.intervals.length > 0 ? "block" : "none";
+                if (processCpuUsage.intervals.length > 0) {
+                    const cap = processCpuUsage.availableParallelism != null
+                        ? `, available_parallelism=${processCpuUsage.availableParallelism}`
+                        : ", available_parallelism=unknown";
+                    console.log(`Process CPU usage: ${processCpuUsage.intervals.length} intervals${cap}`);
+                }
 
                 // Build span data from custom events.  Reset span state
                 // unconditionally here so a trace with no spans doesn't
@@ -2170,6 +2220,7 @@
                 for (const w of workerIds) renderLane(w, drawW);
                 renderSpanPanel(scrollbarW);
                 renderCustomEventsPanel(scrollbarW);
+                renderProcessCpuPanel(scrollbarW);
                 renderTaskDetail(scrollbarW);
                 renderQueueChart(drawW, scrollbarW);
 
@@ -2949,6 +3000,148 @@
                 document.getElementById("ce-panel-info").textContent = `${visible.length} events · ${buckets.size} markers`;
             }
 
+            function fmtCpuCores(value) {
+                if (!Number.isFinite(value)) return "-";
+                return value
+                    .toFixed(value >= 10 ? 1 : 2)
+                    .replace(/(\.\d*?)0+$/, "$1")
+                    .replace(/\.$/, "");
+            }
+
+            function fmtCpuPercent(value) {
+                if (!Number.isFinite(value)) return "-";
+                return `${value.toFixed(1)}%`;
+            }
+
+            function visibleCpuStats() {
+                let visibleIntervals = 0;
+                let maxCores = 0;
+                let totalOverlapNs = 0;
+                let weightedCoresNs = 0;
+                for (const interval of processCpuUsage.intervals) {
+                    if (interval.end < viewStart) continue;
+                    if (interval.start > viewEnd) break;
+                    const overlap = Math.min(interval.end, viewEnd) - Math.max(interval.start, viewStart);
+                    if (!(overlap > 0)) continue;
+                    visibleIntervals++;
+                    if (interval.cores > maxCores) maxCores = interval.cores;
+                    totalOverlapNs += overlap;
+                    weightedCoresNs += interval.cores * overlap;
+                }
+                const avgCores = totalOverlapNs > 0 ? weightedCoresNs / totalOverlapNs : 0;
+                return { visibleIntervals, avgCores, maxCores };
+            }
+
+            function renderProcessCpuPanel(scrollbarW) {
+                const panel = document.getElementById("cpu-panel");
+                if (panel.style.display === "none") return;
+                const c = document.getElementById("cpu-panel-canvas");
+                const ph = 92;
+                const layout = timePanelLayout(panel, scrollbarW);
+                const { pw, drawW, nsToPanelXClamped } = layout;
+                const ctx = layout.resizeCanvas(c, ph);
+                ctx.clearRect(0, 0, pw, ph);
+                ctx.fillStyle = "#111b2e";
+                ctx.fillRect(0, 0, pw, ph);
+                if (drawW <= 0) return;
+
+                const stats = visibleCpuStats();
+                const capacity = processCpuUsage.availableParallelism;
+                const scaleMax = Math.max(1, stats.maxCores, capacity || 0);
+                const chartTop = 20;
+                const chartH = ph - 28;
+
+                ctx.fillStyle = "#667";
+                ctx.font = "10px monospace";
+                ctx.textAlign = "right";
+                ctx.fillText(fmtCpuCores(scaleMax), LABEL_W - 6, chartTop + 9);
+                ctx.fillText("0", LABEL_W - 6, chartTop + chartH);
+
+                ctx.strokeStyle = "rgba(255,255,255,0.07)";
+                ctx.lineWidth = 1;
+                for (let i = 1; i <= 3; i++) {
+                    const y = chartTop + (chartH * i) / 4;
+                    ctx.beginPath();
+                    ctx.moveTo(LABEL_W, y);
+                    ctx.lineTo(LABEL_W + drawW, y);
+                    ctx.stroke();
+                }
+
+                if (capacity != null) {
+                    const capY = chartTop + chartH - (capacity / scaleMax) * chartH;
+                    ctx.strokeStyle = "rgba(255,207,153,0.65)";
+                    ctx.setLineDash([4, 3]);
+                    ctx.beginPath();
+                    ctx.moveTo(LABEL_W, capY);
+                    ctx.lineTo(LABEL_W + drawW, capY);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                    ctx.fillStyle = "#ffcf99";
+                    ctx.textAlign = "left";
+                    ctx.fillText(`${fmtCpuCores(capacity)} core capacity`, LABEL_W + 6, Math.max(12, capY - 4));
+                }
+
+                for (const interval of processCpuUsage.intervals) {
+                    if (interval.end < viewStart) continue;
+                    if (interval.start > viewEnd) break;
+                    const x1 = nsToPanelXClamped(interval.start);
+                    const x2 = nsToPanelXClamped(interval.end);
+                    const w = Math.max(1, x2 - x1);
+                    const y = chartTop + chartH - (interval.cores / scaleMax) * chartH;
+                    const h = chartTop + chartH - y;
+                    const load = capacity != null
+                        ? Math.min(1, interval.cores / capacity)
+                        : Math.min(1, interval.cores / scaleMax);
+                    const r = Math.round(79 + 176 * load);
+                    const g = Math.round(195 - 80 * load);
+                    const b = Math.round(247 - 150 * load);
+                    ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.42)`;
+                    ctx.fillRect(x1, y, w, h);
+                    ctx.strokeStyle = `rgba(${r}, ${g}, ${b}, 0.9)`;
+                    ctx.beginPath();
+                    ctx.moveTo(x1, y);
+                    ctx.lineTo(x1 + w, y);
+                    ctx.stroke();
+                }
+
+                const avgPct = capacity != null ? Math.min(100, (stats.avgCores / capacity) * 100) : null;
+                const capText = capacity != null ? `cap ${fmtCpuCores(capacity)}` : "cap unknown";
+                const pctText = avgPct != null ? ` · avg ${fmtCpuPercent(avgPct)}` : "";
+                document.getElementById("cpu-panel-info").textContent =
+                    `${stats.visibleIntervals} intervals · avg ${fmtCpuCores(stats.avgCores)} cores${pctText} · max ${fmtCpuCores(stats.maxCores)} · ${capText}`;
+            }
+
+            function findProcessCpuIntervalAt(ns) {
+                const intervals = processCpuUsage.intervals;
+                let lo = 0, hi = intervals.length - 1;
+                while (lo <= hi) {
+                    const mid = (lo + hi) >> 1;
+                    const interval = intervals[mid];
+                    if (ns < interval.start) hi = mid - 1;
+                    else if (ns > interval.end) lo = mid + 1;
+                    else return interval;
+                }
+                return null;
+            }
+
+            function cpuIntervalTooltipHtml(interval) {
+                const capacity = processCpuUsage.availableParallelism;
+                let html = `<span class="label">CPU interval:</span> <span class="value">${fmtTs(interval.start)}</span> – <span class="value">${fmtTs(interval.end)}</span>`;
+                html += `<br><span class="label">Window:</span> <span class="value">${formatHumanDuration(interval.wallDeltaNs)}</span>`;
+                html += `<br><span class="label">CPU time:</span> <span class="value">${formatHumanDuration(interval.cpuDeltaNs)}</span>`;
+                html += ` <span style="color:#888">user ${formatHumanDuration(interval.userDeltaNs)} + system ${formatHumanDuration(interval.systemDeltaNs)}</span>`;
+                html += `<br><span class="label">Cores:</span> <span class="value">${fmtCpuCores(interval.cores)}</span>`;
+                if (capacity != null) {
+                    html += ` · <span class="label">Total CPU:</span> <span class="value">${fmtCpuPercent(interval.totalPercent)}</span>`;
+                    html += `<br><span class="label">available_parallelism:</span> <span class="value">${fmtCpuCores(capacity)}</span>`;
+                } else {
+                    html += `<br><span class="label">available_parallelism:</span> <span class="value">unknown</span>`;
+                }
+                html += `<br><span class="label">Sample A cpu time:</span> <span class="value">${formatHumanDuration(interval.startCpuTimeNs)}</span>`;
+                html += `<br><span class="label">Sample B cpu time:</span> <span class="value">${formatHumanDuration(interval.endCpuTimeNs)}</span>`;
+                return html;
+            }
+
             // Find the bucket at a given (x, y) position in the span panel canvas
             function findBucketAtXY(mx, my) {
                 for (let i = spanPanelHits.length - 1; i >= 0; i--) {
@@ -3492,6 +3685,44 @@
                     showEventDetail(hit);
                 }
                 renderAll();
+            });
+
+            document.getElementById("cpu-panel-canvas").addEventListener("mousemove", (e) => {
+                const c = document.getElementById("cpu-panel-canvas");
+                const panel = document.getElementById("cpu-panel");
+                const rect = c.getBoundingClientRect();
+                const mx = e.clientX - rect.left;
+                const scrollbarW = lanesContainer.offsetWidth - lanesContainer.clientWidth;
+                const layout = timePanelLayout(panel, scrollbarW);
+
+                let hit = null;
+                if (mx >= LABEL_W && mx <= LABEL_W + layout.drawW) {
+                    const ns = layout.panelXToNs(mx);
+                    mouseNs = ns;
+                    hit = findProcessCpuIntervalAt(ns);
+                }
+
+                c.style.cursor = hit ? "crosshair" : "default";
+                if (hit) {
+                    tooltip.innerHTML = cpuIntervalTooltipHtml(hit);
+                    tooltip.style.display = "block";
+                    placeTooltip(e);
+                } else {
+                    tooltip.style.display = "none";
+                }
+
+                if (hit !== hoverCpuInterval) {
+                    hoverCpuInterval = hit;
+                    renderCrosshair();
+                }
+            });
+            document.getElementById("cpu-panel-canvas").addEventListener("mouseleave", () => {
+                tooltip.style.display = "none";
+                document.getElementById("cpu-panel-canvas").style.cursor = "default";
+                if (hoverCpuInterval !== null) {
+                    hoverCpuInterval = null;
+                    renderCrosshair();
+                }
             });
 
             /**
@@ -4128,6 +4359,25 @@
                     ctx.lineTo(hx, h);
                     ctx.stroke();
                     ctx.setLineDash([]);
+                }
+
+                // Transient guide lines for the CPU usage interval under hover.
+                if (hoverCpuInterval) {
+                    const start = Math.max(hoverCpuInterval.start, viewStart);
+                    const end = Math.min(hoverCpuInterval.end, viewEnd);
+                    if (start <= end) {
+                        ctx.strokeStyle = "rgba(79,195,247,0.55)";
+                        ctx.lineWidth = 1;
+                        ctx.setLineDash([2, 3]);
+                        for (const ts of [start, end]) {
+                            const x = eventX(ts);
+                            ctx.beginPath();
+                            ctx.moveTo(x, 0);
+                            ctx.lineTo(x, h);
+                            ctx.stroke();
+                        }
+                        ctx.setLineDash([]);
+                    }
                 }
 
                 // Persistent marker + label for the clicked custom event.
@@ -5379,6 +5629,13 @@
                         scheduleCrosshairRedraw();
                         return;
                     }
+                    // CPU panel owns its interval tooltip.
+                    if (e.target.closest && e.target.closest("#cpu-panel")) {
+                        mouseNs = eventToTimelineNs(e.clientX);
+                        lanesContainer.style.cursor = "";
+                        scheduleCrosshairRedraw();
+                        return;
+                    }
                     const rect = lanesContainer.getBoundingClientRect();
                     const mouseX = e.clientX - rect.left - LABEL_W;
                     const mouseY = e.clientY - rect.top;
@@ -5561,6 +5818,7 @@
                 .addEventListener("mouseleave", () => {
                     tooltip.style.display = "none";
                     mouseNs = null;
+                    hoverCpuInterval = null;
                     renderCrosshair();
                 });
 
