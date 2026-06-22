@@ -78,7 +78,9 @@ impl Default for SegmentMetadata {
                 PROCESS_AVAILABLE_PARALLELISM_KEY.to_string(),
                 parallelism.get().to_string(),
             )),
-            Err(e) => tracing::warn!("failed to read process available parallelism: {e}"),
+            Err(e) => rate_limited!(Duration::from_secs(60), {
+                tracing::warn!("failed to read process available parallelism: {e}");
+            }),
         }
         Self { entries }
     }
