@@ -262,7 +262,9 @@ mod unix {
 
             assert_eq!(events.len(), 1);
             let event = &events[0];
-            assert!(event.timestamp_ns > 0);
+            // The non-Linux fallback clock can legitimately return 0 on its
+            // first process call; the event should still not be in the future.
+            assert!(event.timestamp_ns <= clock_monotonic_ns());
             assert!(event.max_rss_bytes > 0);
         }
 
