@@ -26,16 +26,12 @@
     return cpuSamples.some(isCpuProfileSample);
   }
 
-  const PROCESS_RESOURCE_USAGE_EVENT = "ProcessResourceUsageEvent";
-
-  function getTraceTimeRange(events, cpuSamples, customEvents) {
+  function getTraceTimeRange(events, cpuSamples, processResourceUsageSamples) {
     const cpuProfileTimestamps = cpuSamples
       .filter(isCpuProfileSample)
       .map((s) => s.timestamp);
-    const processResourceUsageTimestamps = (customEvents || [])
-      .filter((e) => e.name === PROCESS_RESOURCE_USAGE_EVENT)
-      .map((e) => e.timestamp)
-      .filter((t) => Number.isFinite(t));
+    const processResourceUsageTimestamps = (processResourceUsageSamples || [])
+      .map((s) => s.timestamp);
     const timestamps = events.length
       ? events.map((e) => e.timestamp)
       : cpuProfileTimestamps.length
@@ -53,45 +49,16 @@
     return { minTs, maxTs, durationNs: maxTs - minTs };
   }
 
-  function numericField(value) {
+  function positiveNumber(value) {
     if (value == null || value === "") return null;
     const n = Number(value);
-    return Number.isFinite(n) ? n : null;
+    return Number.isFinite(n) && n > 0 ? n : null;
   }
 
-  function processResourceUsageSample(ev) {
-    const fields = ev.fields || {};
-    const t = numericField(ev.timestamp);
-    const userCpuNs = numericField(fields.user_cpu_ns);
-    const systemCpuNs = numericField(fields.system_cpu_ns);
-    if (
-      t == null ||
-      userCpuNs == null ||
-      systemCpuNs == null ||
-      userCpuNs < 0 ||
-      systemCpuNs < 0
-    ) {
-      return null;
-    }
-    return {
-      t,
-      event: ev,
-      userCpuNs,
-      systemCpuNs,
-      cpuTimeNs: userCpuNs + systemCpuNs,
-    };
-  }
-
-  function buildProcessCpuUsageSeries(customEvents, availableParallelism) {
-    const capacity = numericField(availableParallelism);
-    const normalizedCapacity = capacity != null && capacity > 0 ? capacity : null;
-    const samples = [];
-    for (const ev of customEvents || []) {
-      if (ev.name !== PROCESS_RESOURCE_USAGE_EVENT) continue;
-      const sample = processResourceUsageSample(ev);
-      if (sample) samples.push(sample);
-    }
-    samples.sort((a, b) => a.t - b.t);
+  function buildProcessCpuUsageSeries(processResourceUsageSamples, availableParallelism) {
+    const normalizedCapacity = positiveNumber(availableParallelism);
+    const samples = [...(processResourceUsageSamples || [])];
+    samples.sort((a, b) => a.timestamp - b.timestamp);
 
     const intervals = [];
     let maxCores = 0;
@@ -101,7 +68,7 @@
     for (let i = 1; i < samples.length; i++) {
       const prev = samples[i - 1];
       const cur = samples[i];
-      const wallDeltaNs = cur.t - prev.t;
+      const wallDeltaNs = cur.timestamp - prev.timestamp;
       const userDeltaNs = cur.userCpuNs - prev.userCpuNs;
       const systemDeltaNs = cur.systemCpuNs - prev.systemCpuNs;
       const cpuDeltaNs = userDeltaNs + systemDeltaNs;
@@ -119,9 +86,9 @@
         ? Math.min(100, (cores / normalizedCapacity) * 100)
         : null;
       intervals.push({
-        start: prev.t,
-        end: cur.t,
-        t: cur.t,
+        start: prev.timestamp,
+        end: cur.timestamp,
+        t: cur.timestamp,
         wallDeltaNs,
         userDeltaNs,
         systemDeltaNs,

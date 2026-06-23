@@ -72,9 +72,8 @@ async function main() {
 
   function testResourceOnlyTraceRangeUsesProcessResourceUsageEvents() {
     const range = getTraceTimeRange([], [], [
-      { name: "OtherEvent", timestamp: 50, fields: {} },
-      { name: "ProcessResourceUsageEvent", timestamp: 300, fields: {} },
-      { name: "ProcessResourceUsageEvent", timestamp: 100, fields: {} },
+      { timestamp: 300 },
+      { timestamp: 100 },
     ]);
     if (!range || range.minTs !== 100 || range.maxTs !== 300 || range.durationNs !== 200) {
       fail(`resource-only range should come from process resource usage events, got ${JSON.stringify(range)}`);
@@ -82,23 +81,27 @@ async function main() {
     pass("Resource-only trace range uses process resource usage events");
   }
 
+  function processResourceUsageSample(timestamp, userCpuNs, systemCpuNs) {
+    return {
+      timestamp,
+      userCpuNs,
+      systemCpuNs,
+      cpuTimeNs: userCpuNs + systemCpuNs,
+      maxRssBytes: 0,
+      minorFaults: 0,
+      majorFaults: 0,
+      blockInputOps: 0,
+      blockOutputOps: 0,
+      voluntaryContextSwitches: 0,
+      involuntaryContextSwitches: 0,
+    };
+  }
+
   function testProcessCpuUsageSeriesDerivesIntervals() {
     const series = buildProcessCpuUsageSeries([
-      {
-        name: "ProcessResourceUsageEvent",
-        timestamp: 0,
-        fields: { user_cpu_ns: "100000000", system_cpu_ns: "50000000" },
-      },
-      {
-        name: "ProcessResourceUsageEvent",
-        timestamp: 1_000_000_000,
-        fields: { user_cpu_ns: "500000000", system_cpu_ns: "150000000" },
-      },
-      {
-        name: "ProcessResourceUsageEvent",
-        timestamp: 2_000_000_000,
-        fields: { user_cpu_ns: "1500000000", system_cpu_ns: "1150000000" },
-      },
+      processResourceUsageSample(0, 100_000_000, 50_000_000),
+      processResourceUsageSample(1_000_000_000, 500_000_000, 150_000_000),
+      processResourceUsageSample(2_000_000_000, 1_500_000_000, 1_150_000_000),
     ], "4");
     if (series.availableParallelism !== 4) fail("available parallelism should parse as 4");
     if (series.intervals.length !== 2) fail(`expected 2 CPU intervals, got ${series.intervals.length}`);
@@ -115,27 +118,10 @@ async function main() {
 
   function testProcessCpuUsageSeriesSkipsInvalidPairs() {
     const series = buildProcessCpuUsageSeries([
-      {
-        name: "ProcessResourceUsageEvent",
-        timestamp: 0,
-        fields: { user_cpu_ns: "100", system_cpu_ns: "100" },
-      },
-      {
-        name: "ProcessResourceUsageEvent",
-        timestamp: 0,
-        fields: { user_cpu_ns: "200", system_cpu_ns: "200" },
-      },
-      {
-        name: "ProcessResourceUsageEvent",
-        timestamp: 10,
-        fields: { user_cpu_ns: "150", system_cpu_ns: "250" },
-      },
-      {
-        name: "ProcessResourceUsageEvent",
-        timestamp: 20,
-        fields: { user_cpu_ns: "300", system_cpu_ns: "350" },
-      },
-      { name: "OtherEvent", timestamp: 30, fields: {} },
+      processResourceUsageSample(0, 100, 100),
+      processResourceUsageSample(0, 200, 200),
+      processResourceUsageSample(10, 150, 250),
+      processResourceUsageSample(20, 300, 350),
     ], null);
     if (series.intervals.length !== 1) fail(`expected only one valid CPU interval, got ${series.intervals.length}`);
     if (series.intervals[0].start !== 10 || series.intervals[0].end !== 20) {
@@ -153,6 +139,12 @@ async function main() {
 
   const trace = await parseTrace(fs.readFileSync(tracePath));
   const evts = trace.events;
+  if (!Array.isArray(trace.processResourceUsageSamples) || trace.processResourceUsageSamples.length === 0) {
+    fail("parsed trace should expose typed process resource usage samples");
+  }
+  if (!trace.customEvents.some((e) => e.name === "ProcessResourceUsageEvent")) {
+    fail("process resource usage event should remain visible as a custom event");
+  }
 
   const wSet = new Set();
   evts.forEach((e) => {

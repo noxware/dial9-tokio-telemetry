@@ -938,6 +938,7 @@ async function parseWorkerMain(traceFile, cachePath) {
   }});
   for (const e of trace.events) writeLine({ t: 'e', d: e });
   for (const s of trace.cpuSamples) writeLine({ t: 'c', d: s });
+  if (trace.processResourceUsageSamples) for (const s of trace.processResourceUsageSamples) writeLine({ t: 'p', d: s });
   if (trace.customEvents) for (const x of trace.customEvents) writeLine({ t: 'x', d: x });
   if (trace.allocEvents) for (const a of trace.allocEvents) writeLine({ t: 'a', d: a });
   if (trace.freeEvents) for (const f of trace.freeEvents) writeLine({ t: 'f', d: f });
@@ -956,7 +957,7 @@ function loadCacheFile(cachePath) {
     const s = buf.toString('utf8', pos, nl); pos = nl + 1; return s;
   }
   let raw = null;
-  const events = [], cpuSamples = [], customEvents = [];
+  const events = [], cpuSamples = [], processResourceUsageSamples = [], customEvents = [];
   const allocEvents = [], freeEvents = [];
   let line;
   while ((line = nextLine()) !== null) {
@@ -969,12 +970,13 @@ function loadCacheFile(cachePath) {
         break;
       case 'e': events.push(rec.d); break;
       case 'c': cpuSamples.push(rec.d); break;
+      case 'p': processResourceUsageSamples.push(rec.d); break;
       case 'x': customEvents.push(rec.d); break;
       case 'a': allocEvents.push(rec.d); break;
       case 'f': freeEvents.push(rec.d); break;
     }
   }
-  raw.events = events; raw.cpuSamples = cpuSamples; raw.customEvents = customEvents;
+  raw.events = events; raw.cpuSamples = cpuSamples; raw.processResourceUsageSamples = processResourceUsageSamples; raw.customEvents = customEvents;
   if (!raw.segmentMetadata) raw.segmentMetadata = new Map();
   raw.allocEvents = allocEvents; raw.freeEvents = freeEvents;
   return raw;

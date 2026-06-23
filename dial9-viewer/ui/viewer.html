@@ -1588,7 +1588,7 @@
 
             function processTrace() {
                 const evts = trace.events;
-                const timeRange = getTraceTimeRange(evts, trace.cpuSamples, trace.customEvents);
+                const timeRange = getTraceTimeRange(evts, trace.cpuSamples, trace.processResourceUsageSamples);
                 if (!timeRange) {
                     alert("No runtime events, CPU profile samples, or process resource usage samples in trace");
                     return false;
@@ -1643,7 +1643,7 @@
                 console.log(`Found ${Object.keys(wakesByTask).length} tasks with wake events, ${schedDelays.length} scheduling delays`);
 
                 const availableParallelism = trace.segmentMetadata?.get("process.available_parallelism") ?? null;
-                processCpuUsage = buildProcessCpuUsageSeries(trace.customEvents || [], availableParallelism);
+                processCpuUsage = buildProcessCpuUsageSeries(trace.processResourceUsageSamples || [], availableParallelism);
                 const cpuPanel = document.getElementById("cpu-panel");
                 cpuPanel.style.display = processCpuUsage.intervals.length > 0 ? "block" : "none";
                 if (processCpuUsage.intervals.length > 0) {

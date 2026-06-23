@@ -146,6 +146,22 @@
    */
 
   /**
+   * @typedef {{
+   *   timestamp: number,
+   *   userCpuNs: number,
+   *   systemCpuNs: number,
+   *   cpuTimeNs: number,
+   *   maxRssBytes: number|null,
+   *   minorFaults: number|null,
+   *   majorFaults: number|null,
+   *   blockInputOps: number|null,
+   *   blockOutputOps: number|null,
+   *   voluntaryContextSwitches: number|null,
+   *   involuntaryContextSwitches: number|null,
+   * }} ProcessResourceUsageSample
+   */
+
+  /**
    * @typedef {{ symbol: string, location: string|null }} SymbolFrame
    */
 
@@ -168,6 +184,7 @@
    *   taskTerminateTimes: Map<number, number>,
    *   taskInstrumented: Map<number, boolean>,
    *   cpuSamples: CpuSample[],
+   *   processResourceUsageSamples: ProcessResourceUsageSample[],
    *   callframeSymbols: Map<string, SymbolFrame|SymbolFrame[]>,
    *   threadNames: Map<number, string>,
    *   runtimeWorkers: Map<string, number[]>,
@@ -183,6 +200,49 @@
     QueueSample: 4,
     WakeEvent: 9,
   };
+
+  const PROCESS_RESOURCE_USAGE_EVENT = "ProcessResourceUsageEvent";
+
+  function optionalNum(v) {
+    if (v == null) return null;
+    if (typeof v === "number") return Number.isFinite(v) ? v : null;
+    if (typeof v === "bigint") return Number(v);
+    if (typeof v === "string" && v !== "") {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+    return null;
+  }
+
+  function parseProcessResourceUsageSample(timestamp, fields) {
+    if (timestamp == null || !fields) return null;
+    const userCpuNs = optionalNum(fields.user_cpu_ns);
+    const systemCpuNs = optionalNum(fields.system_cpu_ns);
+    if (userCpuNs == null || systemCpuNs == null) return null;
+    return {
+      timestamp,
+      userCpuNs,
+      systemCpuNs,
+      cpuTimeNs: userCpuNs + systemCpuNs,
+      maxRssBytes: optionalNum(fields.max_rss_bytes),
+      minorFaults: optionalNum(fields.minor_faults),
+      majorFaults: optionalNum(fields.major_faults),
+      blockInputOps: optionalNum(fields.block_input_ops),
+      blockOutputOps: optionalNum(fields.block_output_ops),
+      voluntaryContextSwitches: optionalNum(fields.voluntary_context_switches),
+      involuntaryContextSwitches: optionalNum(fields.involuntary_context_switches),
+    };
+  }
+
+  function processResourceUsageSamplesFromCustomEvents(customEvents) {
+    const samples = [];
+    for (const ev of customEvents || []) {
+      if (ev.name !== PROCESS_RESOURCE_USAGE_EVENT) continue;
+      const sample = parseProcessResourceUsageSample(ev.timestamp, ev.fields);
+      if (sample) samples.push(sample);
+    }
+    return samples;
+  }
 
   /**
    * Sentinel `workerId` used for CPU samples that cannot be confidently
@@ -399,6 +459,7 @@
     const taskInstrumented = new Map(); // taskId -> bool (true if spawned via TelemetryHandle::spawn)
     const callframeSymbols = new Map();
     const cpuSamples = [];
+    const processResourceUsageSamples = [];
     const allocEvents = [];
     const freeEvents = [];
     const memoryOverflows = [];
@@ -712,12 +773,17 @@
         default: {
           // Unrecognized event type: capture as a custom event
           if (ts != null) {
-            customEvents.push({
+            const customEvent = {
               name: frame.name,
               timestamp: ts,
               fields: v,
               units: dec.schemas.get(frame.typeId)?.units || null,
-            });
+            };
+            customEvents.push(customEvent);
+            if (frame.name === PROCESS_RESOURCE_USAGE_EVENT) {
+              const sample = parseProcessResourceUsageSample(ts, v);
+              if (sample) processResourceUsageSamples.push(sample);
+            }
           }
           break;
         }
@@ -795,6 +861,7 @@
       taskSpawnTimes,
       taskInstrumented,
       cpuSamples,
+      processResourceUsageSamples,
       allocEvents,
       freeEvents,
       memoryOverflows,
@@ -838,6 +905,7 @@
     let raw = null;
     const events = [];
     const cpuSamples = [];
+    const processResourceUsageSamples = [];
     const customEvents = [];
     const allocEvents = [];
     const freeEvents = [];
@@ -862,6 +930,7 @@
           break;
         case 'e': events.push(rec.d); break;
         case 'c': cpuSamples.push(rec.d); break;
+        case 'p': processResourceUsageSamples.push(rec.d); break;
         case 'x': customEvents.push(rec.d); break;
         case 'a': allocEvents.push(rec.d); break;
         case 'f': freeEvents.push(rec.d); break;
@@ -870,6 +939,9 @@
     }
     raw.events = events;
     raw.cpuSamples = cpuSamples;
+    raw.processResourceUsageSamples = processResourceUsageSamples.length > 0
+      ? processResourceUsageSamples
+      : processResourceUsageSamplesFromCustomEvents(customEvents);
     if (!raw.segmentMetadata) raw.segmentMetadata = new Map();
     raw.customEvents = customEvents;
     raw.allocEvents = allocEvents;
