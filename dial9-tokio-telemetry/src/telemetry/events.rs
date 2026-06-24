@@ -95,19 +95,31 @@ pub(crate) fn thread_cpu_time_nanos() -> u64 {
 /// all trace timestamps (poll events, CPU samples, sched events).
 #[cfg(target_os = "linux")]
 pub fn clock_monotonic_ns() -> u64 {
+    clock_gettime_ns(libc::CLOCK_MONOTONIC)
+}
+
+/// Read a monotonic clock in nanoseconds. On Apple platforms, `CLOCK_UPTIME_RAW`
+/// matches the clock Rust uses for `Instant` and kernel timeouts.
+#[cfg(target_vendor = "apple")]
+pub fn clock_monotonic_ns() -> u64 {
+    clock_gettime_ns(libc::CLOCK_UPTIME_RAW)
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn clock_gettime_ns(clock_id: libc::clockid_t) -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
     unsafe {
-        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+        libc::clock_gettime(clock_id, &mut ts);
     }
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
-/// `CLOCK_MONOTONIC` in nanoseconds. Non-Linux fallback: elapsed time
-/// since the first call on this process via `Instant`.
-#[cfg(not(target_os = "linux"))]
+/// Portable fallback: elapsed time since the first call on this process via
+/// `Instant`.
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
 pub fn clock_monotonic_ns() -> u64 {
     use std::sync::OnceLock;
     use std::time::Instant;
