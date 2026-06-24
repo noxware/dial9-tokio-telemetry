@@ -1337,13 +1337,31 @@
 
             const FOLDABLE_PANEL_KEYS = ["spans", "events", "cpu", "queue"];
             const PANEL_COLLAPSE_STORAGE_PREFIX = "dial9.viewer.panelCollapsed.";
+            const viewerStorageFallback = new Map();
+
+            function viewerStorageGet(key) {
+                try {
+                    return localStorage.getItem(key);
+                } catch {
+                    return viewerStorageFallback.has(key) ? viewerStorageFallback.get(key) : null;
+                }
+            }
+
+            function viewerStorageSet(key, value) {
+                const stringValue = String(value);
+                try {
+                    localStorage.setItem(key, stringValue);
+                } catch {
+                    viewerStorageFallback.set(key, stringValue);
+                }
+            }
 
             function panelCollapseStorageKey(key) {
                 return PANEL_COLLAPSE_STORAGE_PREFIX + key;
             }
 
             function isPanelCollapsed(key) {
-                return localStorage.getItem(panelCollapseStorageKey(key)) !== "expanded";
+                return viewerStorageGet(panelCollapseStorageKey(key)) !== "expanded";
             }
 
             function syncFoldablePanel(key) {
@@ -1368,7 +1386,7 @@
             }
 
             function setPanelCollapsed(key, collapsed, { redraw = true } = {}) {
-                localStorage.setItem(panelCollapseStorageKey(key), collapsed ? "collapsed" : "expanded");
+                viewerStorageSet(panelCollapseStorageKey(key), collapsed ? "collapsed" : "expanded");
                 syncFoldablePanel(key);
                 if (redraw) renderAll();
             }
