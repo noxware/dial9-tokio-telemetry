@@ -1257,7 +1257,6 @@
             // Timestamp of the custom event currently hovered, for a transient
             // guide line across the lanes. Drawn on the crosshair overlay.
             let hoverEventTs = null;
-            let hoverCpuInterval = null;
             let selectedSpanId = null; // when a span bar is clicked, highlight all polls containing this span
             let selectedSpanIds = new Set(); // includes selected span + parent chain
             // Active task count timeline: [{t, count}]
@@ -1370,7 +1369,6 @@
 
             function setPanelCollapsed(key, collapsed, { redraw = true } = {}) {
                 localStorage.setItem(panelCollapseStorageKey(key), collapsed ? "collapsed" : "expanded");
-                if (key === "cpu") hoverCpuInterval = null;
                 syncFoldablePanel(key);
                 if (redraw) renderAll();
             }
@@ -1480,7 +1478,6 @@
                 relatedExpand = {};
                 relatedItems = [];
                 hoveredWakerTaskId = null;
-                hoverCpuInterval = null;
                 processCpuUsage = { samples: [], intervals: [], availableParallelism: null, maxCores: 0, avgCores: 0 };
                 hideStackPopup();
                 taskDetailPanel.style.display = "none";
@@ -3816,18 +3813,10 @@
                     tooltip.style.display = "none";
                 }
 
-                if (hit !== hoverCpuInterval) {
-                    hoverCpuInterval = hit;
-                    renderCrosshair();
-                }
             });
             document.getElementById("cpu-panel-canvas").addEventListener("mouseleave", () => {
                 tooltip.style.display = "none";
                 document.getElementById("cpu-panel-canvas").style.cursor = "default";
-                if (hoverCpuInterval !== null) {
-                    hoverCpuInterval = null;
-                    renderCrosshair();
-                }
             });
 
             /**
@@ -4465,25 +4454,6 @@
                     ctx.lineTo(hx, h);
                     ctx.stroke();
                     ctx.setLineDash([]);
-                }
-
-                // Transient guide lines for the CPU usage interval under hover.
-                if (hoverCpuInterval) {
-                    const start = Math.max(hoverCpuInterval.start, viewStart);
-                    const end = Math.min(hoverCpuInterval.end, viewEnd);
-                    if (start <= end) {
-                        ctx.strokeStyle = "rgba(79,195,247,0.55)";
-                        ctx.lineWidth = 1;
-                        ctx.setLineDash([2, 3]);
-                        for (const ts of [start, end]) {
-                            const x = eventX(ts);
-                            ctx.beginPath();
-                            ctx.moveTo(x, 0);
-                            ctx.lineTo(x, h);
-                            ctx.stroke();
-                        }
-                        ctx.setLineDash([]);
-                    }
                 }
 
                 // Persistent marker + label for the clicked custom event.
@@ -5924,7 +5894,6 @@
                 .addEventListener("mouseleave", () => {
                     tooltip.style.display = "none";
                     mouseNs = null;
-                    hoverCpuInterval = null;
                     renderCrosshair();
                 });
 
