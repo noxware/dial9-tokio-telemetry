@@ -112,7 +112,7 @@ pub fn clock_monotonic_ns() -> u64 {
     use std::sync::OnceLock;
     use std::time::Instant;
     static EPOCH: OnceLock<Instant> = OnceLock::new();
-    EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
+    (EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64).saturating_add(1)
 }
 
 /// `CLOCK_REALTIME` in nanoseconds since the Unix epoch.
