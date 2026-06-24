@@ -3014,7 +3014,6 @@
             }
 
             function visibleCpuStats() {
-                let visibleIntervals = 0;
                 let maxCores = 0;
                 let totalOverlapNs = 0;
                 let weightedCoresNs = 0;
@@ -3023,13 +3022,12 @@
                     if (interval.start > viewEnd) break;
                     const overlap = Math.min(interval.end, viewEnd) - Math.max(interval.start, viewStart);
                     if (!(overlap > 0)) continue;
-                    visibleIntervals++;
                     if (interval.cores > maxCores) maxCores = interval.cores;
                     totalOverlapNs += overlap;
                     weightedCoresNs += interval.cores * overlap;
                 }
                 const avgCores = totalOverlapNs > 0 ? weightedCoresNs / totalOverlapNs : 0;
-                return { visibleIntervals, avgCores, maxCores };
+                return { avgCores, maxCores };
             }
 
             function renderProcessCpuPanel(scrollbarW) {
@@ -3107,7 +3105,7 @@
                 const avgPct = capacity != null ? Math.min(100, (stats.avgCores / capacity) * 100) : null;
                 const pctText = avgPct != null ? ` · avg ${fmtCpuPercent(avgPct)}` : "";
                 document.getElementById("cpu-panel-info").textContent =
-                    `${stats.visibleIntervals} intervals · avg ${fmtCpuCores(stats.avgCores)} cores${pctText} · max ${fmtCpuCores(stats.maxCores)}`;
+                    `avg ${fmtCpuCores(stats.avgCores)} cores${pctText} · max ${fmtCpuCores(stats.maxCores)}`;
             }
 
             function findProcessCpuIntervalAt(ns) {
