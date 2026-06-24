@@ -96,19 +96,20 @@ pub fn clock_monotonic_ns() -> u64 {
     clock_monotonic_ns_impl()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn clock_monotonic_ns_impl() -> u64 {
-    // Matches Rust's Unix `Instant` backend on Linux.
-    clock_gettime_ns(libc::CLOCK_MONOTONIC)
+    clock_gettime_ns(MONOTONIC_CLOCK_ID)
 }
 
-#[cfg(target_vendor = "apple")]
-fn clock_monotonic_ns_impl() -> u64 {
-    // Matches Rust's Darwin `Instant` backend on Apple platforms.
-    clock_gettime_ns(libc::CLOCK_UPTIME_RAW)
-}
+// Matches Rust's Darwin `Instant` backend on Apple platforms.
+#[cfg(all(unix, target_vendor = "apple"))]
+const MONOTONIC_CLOCK_ID: libc::clockid_t = libc::CLOCK_UPTIME_RAW;
 
-#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+// Matches Rust's Unix `Instant` backend on non-Apple platforms.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+const MONOTONIC_CLOCK_ID: libc::clockid_t = libc::CLOCK_MONOTONIC;
+
+#[cfg(unix)]
 fn clock_gettime_ns(clock_id: libc::clockid_t) -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -120,7 +121,7 @@ fn clock_gettime_ns(clock_id: libc::clockid_t) -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
-#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+#[cfg(not(unix))]
 fn clock_monotonic_ns_impl() -> u64 {
     use std::sync::OnceLock;
     use std::time::Instant;
