@@ -389,6 +389,31 @@
                 position: relative;
                 overflow: hidden;
             }
+            .foldable-panel.is-collapsed {
+                height: 24px !important;
+                cursor: pointer;
+            }
+            .foldable-panel.is-collapsed canvas {
+                display: none !important;
+            }
+            .foldable-panel .chart-label {
+                cursor: pointer;
+                user-select: none;
+            }
+            .foldable-panel .chart-label::before {
+                content: "▾ ";
+                color: #6c63ff;
+            }
+            .foldable-panel.is-collapsed .chart-label::before {
+                content: "▸ ";
+            }
+            .foldable-panel.is-collapsed .chart-label {
+                max-height: 18px !important;
+                overflow: hidden !important;
+            }
+            .foldable-panel.is-collapsed .panel-expanded-label {
+                display: none !important;
+            }
             #span-panel .chart-label {
                 position: absolute;
                 top: 4px;
@@ -851,7 +876,7 @@
                     <button id="btn-span-clear-names" style="font-size:0.8em;display:none">✕ Clear</button>
                     <span id="span-legend-items"></span>
                 </div>
-                <div id="span-panel">
+                <div id="span-panel" class="foldable-panel is-collapsed" data-panel-key="spans">
                     <div class="chart-label" id="span-panel-label">Spans</div>
                     <span id="span-panel-info" style="position:absolute;top:4px;right:12px;font-size:0.75em;color:#aaa;z-index:2;pointer-events:none"></span>
                     <canvas id="span-panel-canvas"></canvas>
@@ -860,12 +885,12 @@
                     <button id="btn-ce-clear-names" style="font-size:0.8em;display:none">✕ Clear</button>
                     <span id="ce-legend-items"></span>
                 </div>
-                <div id="custom-events-panel" style="display:none">
+                <div id="custom-events-panel" class="foldable-panel is-collapsed" data-panel-key="events" style="display:none">
                     <div class="chart-label" id="ce-panel-label">Events</div>
                     <span id="ce-panel-info" style="position:absolute;top:4px;right:12px;font-size:0.75em;color:#aaa;z-index:2;pointer-events:none"></span>
                     <canvas id="ce-panel-canvas"></canvas>
                 </div>
-                <div id="cpu-panel" style="display:none">
+                <div id="cpu-panel" class="foldable-panel is-collapsed" data-panel-key="cpu" style="display:none">
                     <div class="chart-label" id="cpu-panel-label">CPU Usage</div>
                     <span id="cpu-panel-info" style="position:absolute;top:4px;right:12px;font-size:0.75em;color:#aaa;z-index:2;pointer-events:none"></span>
                     <canvas id="cpu-panel-canvas"></canvas>
@@ -875,12 +900,12 @@
                     <span id="task-detail-status" style="position:absolute;top:4px;right:12px;font-size:0.75em;color:#aaa;z-index:2"></span>
                     <canvas id="task-detail-canvas"></canvas>
                 </div>
-                <div id="queue-chart" tabindex="0" aria-label="Queue depth chart">
-                    <span class="chart-label" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-                        <span style="font-weight:600">Queue Depth</span>
-                        <span style="display:flex;align-items:center;gap:4px"><span style="width:12px;height:8px;background:rgba(79,195,247,0.5);border:1px solid #4fc3f7;display:inline-block"></span>Global</span>
-                        <span style="display:flex;align-items:center;gap:4px"><span style="width:12px;height:2px;background:#ff8a65;display:inline-block"></span>Max local</span>
-                        <span style="display:flex;align-items:center;gap:4px"><span style="width:12px;height:2px;background:#81c784;display:inline-block"></span>Active tasks</span>
+                <div id="queue-chart" class="foldable-panel is-collapsed" data-panel-key="queue" tabindex="0" aria-label="Queue depth chart">
+                    <span class="chart-label" style="font-weight:600;white-space:nowrap">
+                        Queue Depth
+                        <span class="panel-expanded-label" style="display:inline-flex;align-items:center;gap:4px;margin-left:10px;font-weight:400"><span style="width:12px;height:8px;background:rgba(79,195,247,0.5);border:1px solid #4fc3f7;display:inline-block"></span>Global</span>
+                        <span class="panel-expanded-label" style="display:inline-flex;align-items:center;gap:4px;margin-left:10px;font-weight:400"><span style="width:12px;height:2px;background:#ff8a65;display:inline-block"></span>Max local</span>
+                        <span class="panel-expanded-label" style="display:inline-flex;align-items:center;gap:4px;margin-left:10px;font-weight:400"><span style="width:12px;height:2px;background:#81c784;display:inline-block"></span>Active tasks</span>
                     </span>
                     <div id="info-panel"></div>
                     <canvas id="queue-canvas"></canvas>
@@ -1308,6 +1333,72 @@
             const taskDetailPanel = document.getElementById("task-detail");
             const clearRangeBtn = document.getElementById("btn-clear-range");
             const tooltip = document.getElementById("tooltip");
+
+            const panelCollapsed = {
+                spans: true,
+                events: true,
+                cpu: true,
+                queue: true,
+            };
+
+            function isPanelCollapsed(key) {
+                return !!panelCollapsed[key];
+            }
+
+            function syncFoldablePanel(key) {
+                const panel = document.querySelector(`[data-panel-key="${key}"]`);
+                if (!panel) return;
+                const collapsed = isPanelCollapsed(key);
+                panel.classList.toggle("is-collapsed", collapsed);
+                const label = panel.querySelector(".chart-label");
+                if (label) label.setAttribute("aria-expanded", collapsed ? "false" : "true");
+
+                if (key === "spans") {
+                    document.getElementById("span-legend").style.display =
+                        !collapsed && panel.style.display !== "none" && allSpans.length > 0 ? "block" : "none";
+                } else if (key === "events") {
+                    document.getElementById("ce-legend").style.display =
+                        !collapsed && panel.style.display !== "none" && genericCustomEvents.length > 0 ? "block" : "none";
+                }
+            }
+
+            function syncFoldablePanels() {
+                for (const key of Object.keys(panelCollapsed)) syncFoldablePanel(key);
+            }
+
+            function setPanelCollapsed(key, collapsed, { redraw = true } = {}) {
+                panelCollapsed[key] = collapsed;
+                if (key === "cpu") hoverCpuInterval = null;
+                syncFoldablePanel(key);
+                if (redraw) renderAll();
+            }
+
+            function resetFoldablePanels() {
+                for (const key of Object.keys(panelCollapsed)) panelCollapsed[key] = true;
+                syncFoldablePanels();
+            }
+
+            for (const panel of document.querySelectorAll(".foldable-panel")) {
+                const key = panel.dataset.panelKey;
+                const label = panel.querySelector(".chart-label");
+                if (label) {
+                    label.setAttribute("role", "button");
+                    label.setAttribute("tabindex", "0");
+                    label.addEventListener("keydown", (e) => {
+                        if (e.key !== "Enter" && e.key !== " ") return;
+                        e.preventDefault();
+                        setPanelCollapsed(key, !isPanelCollapsed(key));
+                    });
+                }
+                panel.addEventListener("click", (e) => {
+                    if (e.target.closest(".kv-copy")) return;
+                    if (!isPanelCollapsed(key) && !e.target.closest(".chart-label")) return;
+                    e.stopPropagation();
+                    setPanelCollapsed(key, !isPanelCollapsed(key));
+                });
+            }
+            syncFoldablePanels();
+
             // Position the (already-populated, display:block) tooltip near the
             // cursor, clamped to the viewport on both axes. Flips above the cursor
             // when it would spill off the bottom. Call after setting innerHTML.
@@ -1397,6 +1488,7 @@
                 hideStackPopup();
                 taskDetailPanel.style.display = "none";
                 document.getElementById("cpu-panel").style.display = "none";
+                resetFoldablePanels();
                 schedPanelTimeRange = null;
 
                 // Default: clear the URL range only when replacing a visible
@@ -1742,6 +1834,7 @@
                         cePanel.style.display = "none";
                     }
                 }
+                syncFoldablePanels();
 
                 return true;
             }
@@ -1910,6 +2003,7 @@
                         });
                     }
                 }
+                syncFoldablePanels();
                 // Show/hide sched panel button based on whether sched events exist
                 let hasSchedEvents = false;
                 for (const w of workerIds) {
@@ -2216,6 +2310,7 @@
                 }
                 window.sharedVisibleMaxQ = maxVisibleQ;
 
+                syncFoldablePanels();
                 renderTimeline(drawW - scrollbarW);
                 for (const w of workerIds) renderLane(w, drawW);
                 renderSpanPanel(scrollbarW);
@@ -2744,11 +2839,31 @@
             // Span panel layout: [{spans, representative, x1, x2, y, h}] — set by renderSpanPanel, used by hit testing
             let spanPanelHits = [];
 
+            function updateSpanPanelLabel() {
+                const label = document.getElementById("span-panel-label");
+                if (focusedSpanId != null) {
+                    const meta = spanMeta.get(focusedSpanId);
+                    const focusedSpan = allSpans.find(s => s.spanId === focusedSpanId);
+                    const fields = focusedSpan?.fields || meta?.fields || {};
+                    const name = meta?.spanName || focusedSpan?.spanName || "Span";
+                    let html = `<div style="color:#ccc;margin-bottom:3px">${esc(name)}</div>`;
+                    for (const [k, v] of Object.entries(fields)) {
+                        html += kvRow(k, formatFieldValue(v));
+                    }
+                    label.innerHTML = html;
+                } else {
+                    label.textContent = "Spans";
+                }
+            }
+
             function renderSpanPanel(scrollbarW) {
                 const panel = document.getElementById("span-panel");
                 if (panel.style.display === "none") return;
                 const c = document.getElementById("span-panel-canvas");
                 const ph = 120;
+                const info = document.getElementById("span-panel-info");
+                spanPanelHits = [];
+                updateSpanPanelLabel();
 
                 // Shared time-panel layout: keeps the draw area aligned with
                 // the worker lanes and task detail.  See TIME-PANEL LAYOUT
@@ -2759,11 +2874,10 @@
                 // label are obscured by design (confirmed in design review).
                 const layout = timePanelLayout(panel, scrollbarW);
                 const { pw, drawW, nsToPanelX, nsToPanelXClamped } = layout;
-                const ctx = layout.resizeCanvas(c, ph);
-                ctx.clearRect(0, 0, pw, ph);
-                spanPanelHits = [];
-
-                if (drawW <= 0) return;
+                if (drawW <= 0) {
+                    info.textContent = "";
+                    return;
+                }
 
                 // 1. Filter to visible + matching spans
                 const visibleSpans = [];
@@ -2774,6 +2888,10 @@
                 }
 
                 if (visibleSpans.length === 0) {
+                    info.textContent = "";
+                    if (isPanelCollapsed("spans")) return;
+                    const ctx = layout.resizeCanvas(c, ph);
+                    ctx.clearRect(0, 0, pw, ph);
                     ctx.fillStyle = "#555";
                     ctx.font = "12px sans-serif";
                     ctx.fillText("No spans in view" + (spanFilter ? ` (filter: "${spanFilter}")` : ""), LABEL_W + 10, 60);
@@ -2788,6 +2906,10 @@
                 });
 
                 if (renderSet.length === 0) {
+                    info.textContent = "0 spans · 0 clusters";
+                    if (isPanelCollapsed("spans")) return;
+                    const ctx = layout.resizeCanvas(c, ph);
+                    ctx.clearRect(0, 0, pw, ph);
                     ctx.fillStyle = "#555";
                     ctx.font = "12px sans-serif";
                     ctx.fillText("No root spans in view", LABEL_W + 10, 60);
@@ -2806,6 +2928,13 @@
                     clusterXPx: CLUSTER_X,
                     barH: BAR_H,
                 });
+
+                const focusNote = focusedSpanId != null ? " (focused)" : "";
+                info.textContent = `${renderSet.length} spans · ${spanLayout.buckets.length} clusters${focusNote}`;
+                if (isPanelCollapsed("spans")) return;
+
+                const ctx = layout.resizeCanvas(c, ph);
+                ctx.clearRect(0, 0, pw, ph);
 
                 // When focused: pin parent at top, children packed right below
                 if (focusedSpanId != null) {
@@ -2888,26 +3017,6 @@
                         ctx.fillText(formatHumanDuration(dur), LABEL_W + 2, y - 2);
                     }
                 }
-
-                const info = document.getElementById("span-panel-info");
-                const focusNote = focusedSpanId != null ? " (focused)" : "";
-                info.textContent = `${renderSet.length} spans · ${spanLayout.buckets.length} clusters${focusNote}`;
-
-                // Update left label: show focused span's fields or default "Spans"
-                const label = document.getElementById("span-panel-label");
-                if (focusedSpanId != null) {
-                    const meta = spanMeta.get(focusedSpanId);
-                    const focusedSpan = allSpans.find(s => s.spanId === focusedSpanId);
-                    const fields = focusedSpan?.fields || meta?.fields || {};
-                    const name = meta?.spanName || focusedSpan?.spanName || "Span";
-                    let html = `<div style="color:#ccc;margin-bottom:3px">${esc(name)}</div>`;
-                    for (const [k, v] of Object.entries(fields)) {
-                        html += kvRow(k, formatFieldValue(v));
-                    }
-                    label.innerHTML = html;
-                } else {
-                    label.textContent = "Spans";
-                }
             }
 
             function renderCustomEventsPanel(scrollbarW) {
@@ -2915,14 +3024,15 @@
                 if (panel.style.display === "none") return;
                 const c = document.getElementById("ce-panel-canvas");
                 const ph = 40;
+                const info = document.getElementById("ce-panel-info");
+                cePanelHits = [];
 
                 const layout = timePanelLayout(panel, scrollbarW);
                 const { pw, drawW, nsToPanelX, nsToPanelXClamped } = layout;
-                const ctx = layout.resizeCanvas(c, ph);
-                ctx.clearRect(0, 0, pw, ph);
-                cePanelHits = [];
-
-                if (drawW <= 0) return;
+                if (drawW <= 0) {
+                    info.textContent = "";
+                    return;
+                }
 
                 // Filter to visible events matching name selection
                 const visible = [];
@@ -2933,10 +3043,13 @@
                 }
 
                 if (visible.length === 0) {
+                    info.textContent = "";
+                    if (isPanelCollapsed("events")) return;
+                    const ctx = layout.resizeCanvas(c, ph);
+                    ctx.clearRect(0, 0, pw, ph);
                     ctx.fillStyle = "#555";
                     ctx.font = "12px sans-serif";
                     ctx.fillText(genericCustomEvents.length === 0 ? "No custom events" : "No events in view", LABEL_W + 10, 24);
-                    document.getElementById("ce-panel-info").textContent = "";
                     return;
                 }
 
@@ -2949,6 +3062,12 @@
                     if (!bucket) { bucket = []; buckets.set(px, bucket); }
                     bucket.push(ev);
                 }
+
+                info.textContent = `${visible.length} events · ${buckets.size} markers`;
+                if (isPanelCollapsed("events")) return;
+
+                const ctx = layout.resizeCanvas(c, ph);
+                ctx.clearRect(0, 0, pw, ph);
 
                 for (const [px, events] of buckets) {
                     const rep = events[0];
@@ -2996,8 +3115,6 @@
                     cePanelHits.push({ events, x: px - hitW / 2, y, w: hitW, h, taskId });
                 }
                 ctx.globalAlpha = 1.0;
-
-                document.getElementById("ce-panel-info").textContent = `${visible.length} events · ${buckets.size} markers`;
             }
 
             function fmtCpuCores(value) {
@@ -3035,6 +3152,14 @@
                 if (panel.style.display === "none") return;
                 const c = document.getElementById("cpu-panel-canvas");
                 const ph = 92;
+                const stats = visibleCpuStats();
+                const capacity = processCpuUsage.availableParallelism;
+                const avgPct = capacity != null ? Math.min(100, (stats.avgCores / capacity) * 100) : null;
+                const pctText = avgPct != null ? ` · avg ${fmtCpuPercent(avgPct)}` : "";
+                document.getElementById("cpu-panel-info").textContent =
+                    `avg ${fmtCpuCores(stats.avgCores)} cores${pctText} · max ${fmtCpuCores(stats.maxCores)}`;
+                if (isPanelCollapsed("cpu")) return;
+
                 const layout = timePanelLayout(panel, scrollbarW);
                 const { pw, drawW, nsToPanelXClamped } = layout;
                 const ctx = layout.resizeCanvas(c, ph);
@@ -3043,8 +3168,6 @@
                 ctx.fillRect(0, 0, pw, ph);
                 if (drawW <= 0) return;
 
-                const stats = visibleCpuStats();
-                const capacity = processCpuUsage.availableParallelism;
                 const scaleMax = Math.max(1, stats.maxCores, capacity || 0);
                 const chartTop = 20;
                 const chartH = ph - 28;
@@ -3102,10 +3225,6 @@
                     ctx.stroke();
                 }
 
-                const avgPct = capacity != null ? Math.min(100, (stats.avgCores / capacity) * 100) : null;
-                const pctText = avgPct != null ? ` · avg ${fmtCpuPercent(avgPct)}` : "";
-                document.getElementById("cpu-panel-info").textContent =
-                    `avg ${fmtCpuCores(stats.avgCores)} cores${pctText} · max ${fmtCpuCores(stats.maxCores)}`;
             }
 
             function findProcessCpuIntervalAt(ns) {
@@ -4077,6 +4196,7 @@
             function renderQueueChart(drawW, scrollbarW) {
                 const c = queueCanvas;
                 const parent = c.parentElement;
+                if (isPanelCollapsed("queue")) return;
                 const dpr = devicePixelRatio || 1;
                 const pw = parent.clientWidth,
                     ph = parent.clientHeight;
