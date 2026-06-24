@@ -401,11 +401,15 @@
                 user-select: none;
             }
             .foldable-panel .chart-label::before {
-                content: "▾ ";
+                content: "▼";
                 color: #6c63ff;
+                display: inline-block;
+                font-size: 0.85em;
+                margin-right: 7px;
+                transform: translateY(-1px);
             }
             .foldable-panel.is-collapsed .chart-label::before {
-                content: "▸ ";
+                content: "▶";
             }
             .foldable-panel.is-collapsed .chart-label {
                 max-height: 18px !important;
@@ -901,9 +905,7 @@
                     <canvas id="task-detail-canvas"></canvas>
                 </div>
                 <div id="queue-chart" class="foldable-panel is-collapsed" data-panel-key="queue" tabindex="0" aria-label="Queue depth chart">
-                    <span class="chart-label" style="font-weight:600;white-space:nowrap">
-                        Queue Depth
-                        <span class="panel-expanded-label" style="display:inline-flex;align-items:center;gap:4px;margin-left:10px;font-weight:400"><span style="width:12px;height:8px;background:rgba(79,195,247,0.5);border:1px solid #4fc3f7;display:inline-block"></span>Global</span>
+                    <span class="chart-label" style="font-weight:600;white-space:nowrap">Queue Depth<span class="panel-expanded-label" style="display:inline-flex;align-items:center;gap:4px;margin-left:10px;font-weight:400"><span style="width:12px;height:8px;background:rgba(79,195,247,0.5);border:1px solid #4fc3f7;display:inline-block"></span>Global</span>
                         <span class="panel-expanded-label" style="display:inline-flex;align-items:center;gap:4px;margin-left:10px;font-weight:400"><span style="width:12px;height:2px;background:#ff8a65;display:inline-block"></span>Max local</span>
                         <span class="panel-expanded-label" style="display:inline-flex;align-items:center;gap:4px;margin-left:10px;font-weight:400"><span style="width:12px;height:2px;background:#81c784;display:inline-block"></span>Active tasks</span>
                     </span>
