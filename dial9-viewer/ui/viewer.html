@@ -6391,6 +6391,7 @@
             let qcDragging = false, qcDragStartX = 0, qcDragStartNs = 0, qcDragEndNs = 0, qcDragMoved = false;
 
             document.getElementById("queue-chart").addEventListener("mousedown", (e) => {
+                if (isPanelCollapsed("queue")) return;
                 if (!trace || !activeTaskSamples.length) return;
                 qcDragging = true;
                 qcDragMoved = false;
