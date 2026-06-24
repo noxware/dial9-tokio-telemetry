@@ -1336,15 +1336,15 @@
             const clearRangeBtn = document.getElementById("btn-clear-range");
             const tooltip = document.getElementById("tooltip");
 
-            const panelCollapsed = {
-                spans: true,
-                events: true,
-                cpu: true,
-                queue: true,
-            };
+            const FOLDABLE_PANEL_KEYS = ["spans", "events", "cpu", "queue"];
+            const PANEL_COLLAPSE_STORAGE_PREFIX = "dial9.viewer.panelCollapsed.";
+
+            function panelCollapseStorageKey(key) {
+                return PANEL_COLLAPSE_STORAGE_PREFIX + key;
+            }
 
             function isPanelCollapsed(key) {
-                return !!panelCollapsed[key];
+                return localStorage.getItem(panelCollapseStorageKey(key)) !== "expanded";
             }
 
             function syncFoldablePanel(key) {
@@ -1365,19 +1365,14 @@
             }
 
             function syncFoldablePanels() {
-                for (const key of Object.keys(panelCollapsed)) syncFoldablePanel(key);
+                for (const key of FOLDABLE_PANEL_KEYS) syncFoldablePanel(key);
             }
 
             function setPanelCollapsed(key, collapsed, { redraw = true } = {}) {
-                panelCollapsed[key] = collapsed;
+                localStorage.setItem(panelCollapseStorageKey(key), collapsed ? "collapsed" : "expanded");
                 if (key === "cpu") hoverCpuInterval = null;
                 syncFoldablePanel(key);
                 if (redraw) renderAll();
-            }
-
-            function resetFoldablePanels() {
-                for (const key of Object.keys(panelCollapsed)) panelCollapsed[key] = true;
-                syncFoldablePanels();
             }
 
             for (const panel of document.querySelectorAll(".foldable-panel")) {
@@ -1490,7 +1485,6 @@
                 hideStackPopup();
                 taskDetailPanel.style.display = "none";
                 document.getElementById("cpu-panel").style.display = "none";
-                resetFoldablePanels();
                 schedPanelTimeRange = null;
 
                 // Default: clear the URL range only when replacing a visible
