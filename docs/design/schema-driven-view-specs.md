@@ -24,8 +24,9 @@ Stable terms:
 | `multi-series` | One panel with more than one series, e.g. Queue Depth. |
 | `source` | Named event stream used by a spec. |
 | `point` | One output item produced by a computed series. |
-| `view` | Generic panel type and rendering hints. |
-| `mark` | Shape used for one series inside a view: `line`, `step_line`, `step_area`, `bars`, `points`. |
+| `view` | One recommended viewer panel. |
+| `display` | Generic panel type and rendering hints. |
+| `mark` | Shape used for one series inside a display: `line`, `step_line`, `step_area`, `bars`, `points`. |
 
 Recommended bundle shape:
 
@@ -281,7 +282,7 @@ Bundle shape:
       sources: [
         { id: "usage", event: "ProcessResourceUsageEvent" }
       ],
-      view: {
+      display: {
         kind: "time_series"
       },
       series: [
@@ -317,20 +318,20 @@ Potential attributes:
 | `color` | series | Optional fixed color or palette key. |
 | `thresholds` | series | Values used for warning/danger coloring. |
 | `tooltip` | series/view | Tooltip rows. |
-| `view.kind` | view | `time_series`, `interval_bars`, `markers`, `heatmap`, `flamegraph`. |
-| `view.y_min` | view | Optional Y-axis minimum. |
-| `view.y_max` | view | Optional Y-axis maximum. |
-| `view.guides` | view | Reference lines/bands. |
-| `downsample` | series/view | `last_per_pixel`, `max_per_pixel`, `avg_per_pixel`, `min_max_per_pixel`. |
+| `display.kind` | display | `time_series`, `interval_bars`, `markers`, `heatmap`, `flamegraph`. |
+| `display.y_min` | display | Optional Y-axis minimum. |
+| `display.y_max` | display | Optional Y-axis maximum. |
+| `display.guides` | display | Reference lines/bands. |
+| `downsample` | series/display | `last_per_pixel`, `max_per_pixel`, `avg_per_pixel`, `min_max_per_pixel`. |
 | `window.missing_previous` | series | `skip`, `null`, `zero` for previous-sample expressions such as `rate`. |
 | `window.on_decrease` | series | `skip`, `warn`, `show` when previous-sample expressions detect an unexpected decrease. |
 | `sort` | source/series | Event ordering; default is timestamp. |
 
-## View Specs
+## Display Specs
 
-Initial view kinds:
+Initial display kinds:
 
-| `view.kind` | Current UI example | Notes |
+| `display.kind` | Current UI example | Notes |
 | --- | --- | --- |
 | `time_series` | CPU Usage, Queue Depth | X axis is time, Y axis is numeric value. |
 | `interval_bars` | Worker lanes, Spans | Items have `start` and `end`. |
@@ -364,7 +365,7 @@ Initial implementation should focus on `time_series` only, but keep shape extens
       sources: [
         { id: "usage", event: "ProcessResourceUsageEvent" }
       ],
-      view: {
+      display: {
         kind: "time_series",
         y_min: 0,
         guides: [
@@ -442,7 +443,7 @@ The examples below show individual view specs. They can be wrapped in the bundle
   sources: [
     { id: "accept", event: "TcpAcceptQueueEvent" }
   ],
-  view: {
+  display: {
     kind: "time_series",
     y_min: 0,
     y_max: 100
@@ -482,7 +483,7 @@ The examples below show individual view specs. They can be wrapped in the bundle
   sources: [
     { id: "usage", event: "ProcessResourceUsageEvent" }
   ],
-  view: { kind: "time_series" },
+  display: { kind: "time_series" },
   series: [
     {
       id: "max_rss",
@@ -514,7 +515,7 @@ This is not first-iteration scope, but the spec shape should not block it.
     { id: "spawn", event: "TaskSpawnEvent" },
     { id: "terminate", event: "TaskTerminateEvent" }
   ],
-  view: { kind: "time_series" },
+  display: { kind: "time_series" },
   series: [
     {
       id: "global",
@@ -569,7 +570,7 @@ Not first-iteration scope.
     key: "enter.span_id",
     close: "close.span_id"
   },
-  view: {
+  display: {
     kind: "interval_bars",
     color_by: "duration"
   },
@@ -595,7 +596,7 @@ Implement first:
 - Implement first expression support: field access, metadata access, arithmetic, `rate(value, time)`, `group_by`.
 - Implement generic `renderTimeSeriesPanel(spec, resolvedSeries)` using existing `timePanelLayout`.
 - Support `mark`: `step_line`, `step_area`, maybe `line`.
-- Support `view.guides`, `tooltip`, `thresholds`, `downsample` for `time_series`.
+- Support `display.guides`, `tooltip`, `thresholds`, `downsample` for `time_series`.
 - Migrate CPU Usage to the generic spec path.
 - Add Max RSS and Socket Accept Queue specs as validation cases if practical.
 
