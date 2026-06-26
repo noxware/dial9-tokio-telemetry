@@ -2,7 +2,7 @@
 
 Status: working design draft.
 
-Goal: let traces describe common computed values and recommended viewer panels so adding charts like process CPU, memory, or socket queue utilization does not require event-specific frontend code.
+Goal: let traces describe computed values and recommended viewer panels so adding common visualizations does not require event-specific frontend code. Simple validation cases include process CPU, memory, and socket queue utilization; the design should also leave room for current hardcoded viewer concepts such as queue depth, event markers, span interval bars, worker lanes, scheduling overlays, heatmaps, and eventually stack-based views like flamegraphs.
 
 The viewer still owns rendering. Rust/schema metadata should describe data semantics, computed values, and recommended views, not Canvas implementation details.
 
@@ -100,6 +100,8 @@ Global metadata access:
 expr: "metadata['process.available_parallelism']"
 ```
 
+Use bracket syntax because metadata keys may contain dots, e.g. `process.available_parallelism`.
+
 Computed series output access in tooltips:
 
 ```js
@@ -147,8 +149,7 @@ Rate over event order:
     ]
   },
   time: { field: "usage.timestamp" },
-  missingPrevious: "skip",
-  onDecrease: "skip"
+  missingPrevious: "skip"
 }
 ```
 
@@ -291,8 +292,7 @@ Potential attributes:
 | `guides` | view | Reference lines/bands. |
 | `downsample` | series/view | `last_per_pixel`, `max_per_pixel`, `avg_per_pixel`, `min_max_per_pixel`. |
 | `missingPrevious` | series expression | `skip`, `null`, `zero`. |
-| `onDecrease` | series expression | `skip`, `warn`, `show`. |
-| `visibleByDefault` | view | Initial collapsed/visible behavior. |
+| `metric.onDecrease` | series metric | `skip`, `warn`, `show` for counters that decrease unexpectedly. |
 | `sort` | source/series | Event ordering; default is timestamp. |
 
 ## View Specs
@@ -308,6 +308,8 @@ Initial view kinds:
 | `flamegraph` | Flamegraph sidebar | Stack aggregation, not time-axis aligned. |
 
 Initial implementation should focus on `time_series` only, but keep shape extensible.
+
+`time_series` is intentionally time-axis specific so it can align with the current viewer timeline. A future arbitrary X-axis view should use a separate kind such as `xy_plot`.
 
 ## Example: CPU Usage
 
@@ -329,9 +331,8 @@ Initial implementation should focus on `time_series` only, but keep shape extens
       expr: "rate(usage.user_cpu_ns + usage.system_cpu_ns, usage.timestamp)",
       unit: "cores",
       mark: "step_area",
-      metric: { kind: "counter" },
+      metric: { kind: "counter", onDecrease: "skip" },
       missingPrevious: "skip",
-      onDecrease: "skip",
       downsample: "max_per_pixel",
       tooltip: [
         { label: "Window", expr: "point.wall_delta_ns", unit: "ns" },
