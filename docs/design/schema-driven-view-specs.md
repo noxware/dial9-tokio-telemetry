@@ -27,6 +27,17 @@ Stable terms:
 | `view` | Generic panel type and rendering hints. |
 | `mark` | Shape used for one series inside a view: `line`, `step_line`, `step_area`, `bars`, `points`. |
 
+Recommended bundle shape:
+
+```js
+{
+  computed_fields: [ /* event-local computed values */ ],
+  views: [ /* recommended viewer panels */ ]
+}
+```
+
+`computed_fields` are intentionally outside `series`: they should be available anywhere an event is shown, including the generic/custom events UI.
+
 ## Metric Vocabulary
 
 Use metric words as semantics, not as direct rendering instructions.
@@ -149,7 +160,7 @@ Rate over event order:
     ]
   },
   time: { field: "usage.timestamp" },
-  missingPrevious: "skip"
+  missing_previous: "skip"
 }
 ```
 
@@ -219,7 +230,7 @@ event.computed = {
   cpu_time_ns: 150
 };
 
-event.computedUnits = {
+event.computed_units = {
   cpu_time_ns: "ns"
 };
 ```
@@ -235,7 +246,7 @@ Example spec:
   unit: "ns",
   metric: { kind: "counter" },
   label: "CPU time",
-  onCollision: "error"
+  on_collision: "error"
 }
 ```
 
@@ -247,26 +258,40 @@ expr: "rate(usage.cpu_time_ns, usage.timestamp)"
 
 Collision rule: a computed field should not silently overwrite a raw field.
 
-## Series Specs
+## Series And View Specs
 
-Top-level shape:
+Bundle shape:
 
 ```js
 {
-  id: "process.cpu",
-  title: "CPU Usage",
-  sources: [
-    { id: "usage", event: "ProcessResourceUsageEvent" }
-  ],
-  view: {
-    kind: "time_series"
-  },
-  series: [
+  computed_fields: [
     {
-      id: "cores",
-      expr: "rate(usage.user_cpu_ns + usage.system_cpu_ns, usage.timestamp)",
-      unit: "cores",
-      mark: "step_area"
+      id: "process_resource_usage.cpu_time_ns",
+      source: { id: "usage", event: "ProcessResourceUsageEvent" },
+      name: "cpu_time_ns",
+      expr: "usage.user_cpu_ns + usage.system_cpu_ns",
+      unit: "ns",
+      metric: { kind: "counter" }
+    }
+  ],
+  views: [
+    {
+      id: "process.cpu",
+      title: "CPU Usage",
+      sources: [
+        { id: "usage", event: "ProcessResourceUsageEvent" }
+      ],
+      view: {
+        kind: "time_series"
+      },
+      series: [
+        {
+          id: "cores",
+          expr: "rate(usage.cpu_time_ns, usage.timestamp)",
+          unit: "cores",
+          mark: "step_area"
+        }
+      ]
     }
   ]
 }
@@ -276,23 +301,29 @@ Potential attributes:
 
 | Attribute | Scope | Meaning |
 | --- | --- | --- |
-| `id` | view/series | Stable identifier. |
+| `computed_fields` | bundle | Event-local computed values available to all event renderers. |
+| `views` | bundle | Recommended viewer panels. |
+| `id` | computed field/view/series | Stable identifier. |
 | `title` | view/series | Human label. |
 | `sources` | view | Event streams used by this view. |
 | `source` | computed field | Single aliased event stream used by an event-local computed field. |
+| `on_collision` | computed field | `error`, `skip`, or `overwrite` when a computed field name conflicts with a raw field. |
 | `expr` | series/tooltip/guide/computed field | Expression to evaluate. |
 | `unit` | series/computed field/tooltip | Output unit. |
-| `metric.kind` | series/computed field/field metadata | `gauge`, `counter`, `up_down_counter`. |
+| `metric.kind` | series output/computed field/field metadata | `gauge`, `counter`, `up_down_counter`. |
 | `group_by` | series | Split output into one series per unique key tuple. |
 | `reduce` | series | Collapse groups or multiple streams: `max`, `sum`, `avg`, `last`. |
 | `mark` | series | `line`, `step_line`, `step_area`, `bars`, `points`. |
 | `color` | series | Optional fixed color or palette key. |
 | `thresholds` | series | Values used for warning/danger coloring. |
 | `tooltip` | series/view | Tooltip rows. |
-| `guides` | view | Reference lines/bands. |
+| `view.kind` | view | `time_series`, `interval_bars`, `markers`, `heatmap`, `flamegraph`. |
+| `view.y_min` | view | Optional Y-axis minimum. |
+| `view.y_max` | view | Optional Y-axis maximum. |
+| `view.guides` | view | Reference lines/bands. |
 | `downsample` | series/view | `last_per_pixel`, `max_per_pixel`, `avg_per_pixel`, `min_max_per_pixel`. |
-| `missingPrevious` | series expression | `skip`, `null`, `zero`. |
-| `metric.onDecrease` | series metric | `skip`, `warn`, `show` for counters that decrease unexpectedly. |
+| `window.missing_previous` | series | `skip`, `null`, `zero` for previous-sample expressions such as `rate`. |
+| `window.on_decrease` | series | `skip`, `warn`, `show` when previous-sample expressions detect an unexpected decrease. |
 | `sort` | source/series | Event ordering; default is timestamp. |
 
 ## View Specs
@@ -315,42 +346,60 @@ Initial implementation should focus on `time_series` only, but keep shape extens
 
 ```js
 {
-  id: "process.cpu",
-  title: "CPU Usage",
-  sources: [
-    { id: "usage", event: "ProcessResourceUsageEvent" }
-  ],
-  view: {
-    kind: "time_series",
-    yMin: 0
-  },
-  series: [
+  computed_fields: [
     {
-      id: "cores",
-      title: "CPU",
-      expr: "rate(usage.user_cpu_ns + usage.system_cpu_ns, usage.timestamp)",
-      unit: "cores",
-      mark: "step_area",
-      metric: { kind: "counter", onDecrease: "skip" },
-      missingPrevious: "skip",
-      downsample: "max_per_pixel",
-      tooltip: [
-        { label: "Window", expr: "point.wall_delta_ns", unit: "ns" },
-        { label: "CPU time", expr: "point.value_delta_ns", unit: "ns" },
-        { label: "Cores", expr: "point.value", unit: "cores" },
-        {
-          label: "Total CPU",
-          expr: "point.value / metadata['process.available_parallelism'] * 100",
-          unit: "%"
-        }
-      ]
+      id: "process_resource_usage.cpu_time_ns",
+      source: { id: "usage", event: "ProcessResourceUsageEvent" },
+      name: "cpu_time_ns",
+      expr: "usage.user_cpu_ns + usage.system_cpu_ns",
+      unit: "ns",
+      metric: { kind: "counter" },
+      label: "CPU time"
     }
   ],
-  guides: [
+  views: [
     {
-      kind: "horizontal_line",
-      expr: "metadata['process.available_parallelism']",
-      label: "core capacity"
+      id: "process.cpu",
+      title: "CPU Usage",
+      sources: [
+        { id: "usage", event: "ProcessResourceUsageEvent" }
+      ],
+      view: {
+        kind: "time_series",
+        y_min: 0,
+        guides: [
+          {
+            kind: "horizontal_line",
+            expr: "metadata['process.available_parallelism']",
+            label: "core capacity"
+          }
+        ]
+      },
+      series: [
+        {
+          id: "cores",
+          title: "CPU",
+          expr: "rate(usage.cpu_time_ns, usage.timestamp)",
+          unit: "cores",
+          mark: "step_area",
+          metric: { kind: "gauge" },
+          window: {
+            missing_previous: "skip",
+            on_decrease: "skip"
+          },
+          downsample: "max_per_pixel",
+          tooltip: [
+            { label: "Window", expr: "point.wall_delta_ns", unit: "ns" },
+            { label: "CPU time", expr: "point.value_delta_ns", unit: "ns" },
+            { label: "Cores", expr: "point.value", unit: "cores" },
+            {
+              label: "Total CPU",
+              expr: "point.value / metadata['process.available_parallelism'] * 100",
+              unit: "%"
+            }
+          ]
+        }
+      ]
     }
   ]
 }
@@ -361,6 +410,10 @@ Input events:
 ```js
 usage[0] = { timestamp: 1000, user_cpu_ns: 100, system_cpu_ns: 50 };
 usage[1] = { timestamp: 2000, user_cpu_ns: 500, system_cpu_ns: 150 };
+
+// After computed_fields:
+usage[0].cpu_time_ns = 150;
+usage[1].cpu_time_ns = 650;
 ```
 
 Output point:
@@ -380,6 +433,8 @@ Output point:
 
 ## Example: Socket Accept Queue Utilization
 
+The examples below show individual view specs. They can be wrapped in the bundle `views` array when transmitted together with computed fields.
+
 ```js
 {
   id: "socket.accept_queue",
@@ -389,8 +444,8 @@ Output point:
   ],
   view: {
     kind: "time_series",
-    yMin: 0,
-    yMax: 100
+    y_min: 0,
+    y_max: 100
   },
   series: [
     {
@@ -534,12 +589,13 @@ Implement first:
 
 - Preserve all events in `trace.eventStreams` or `trace.allEvents`, including built-in events.
 - Keep schema and unit metadata available for every event stream.
-- Add hardcoded JS specs using the same shape expected from future trace metadata.
+- Add hardcoded JS spec bundles using the same shape expected from future trace metadata.
+- Implement `computed_fields` and expose them in generic/custom event detail rendering.
 - Implement `buildTimeSeriesFromSpec(trace, spec)`.
 - Implement first expression support: field access, metadata access, arithmetic, `rate(value, time)`, `group_by`.
 - Implement generic `renderTimeSeriesPanel(spec, resolvedSeries)` using existing `timePanelLayout`.
 - Support `mark`: `step_line`, `step_area`, maybe `line`.
-- Support `guides`, `tooltip`, `thresholds`, `downsample` for `time_series`.
+- Support `view.guides`, `tooltip`, `thresholds`, `downsample` for `time_series`.
 - Migrate CPU Usage to the generic spec path.
 - Add Max RSS and Socket Accept Queue specs as validation cases if practical.
 
@@ -558,7 +614,7 @@ Second phase:
 - Decide where global view specs live in the trace format.
 - Avoid overloading `FieldAnnotation` for schema-wide or trace-wide specs.
 - Keep field annotations for field-local metadata such as `unit` and metric semantics.
-- Add a schema-level or trace-level metadata mechanism for view/computed-series specs.
+- Add a schema-level or trace-level metadata mechanism for computed fields and view specs.
 - Add Rust builders/macros only after the JSON shape is validated in JS.
 - Generate specs as JSON or equivalent structured data from Rust.
 
@@ -567,24 +623,39 @@ Potential Rust ergonomics:
 ```rust
 #[traceevent(computed(
     name = "cpu_time_ns",
-    expr = "usage.user_cpu_ns + usage.system_cpu_ns",
+    expr = "user_cpu_ns + system_cpu_ns",
     unit = "ns",
     metric = "counter"
 ))]
 ```
 
 ```rust
-TraceViewSpec::builder()
-    .id("process.cpu")
-    .title("CPU Usage")
-    .time_series()
-    .source("usage", "ProcessResourceUsageEvent")
-    .series(
-        SeriesSpec::builder()
-            .id("cores")
-            .expr("rate(usage.user_cpu_ns + usage.system_cpu_ns, usage.timestamp)")
-            .unit("cores")
-            .mark("step_area")
+TraceSpecBundle::builder()
+    .computed_field(
+        ComputedFieldSpec::builder()
+            .source("usage", "ProcessResourceUsageEvent")
+            .name("cpu_time_ns")
+            .expr("usage.user_cpu_ns + usage.system_cpu_ns")
+            .unit("ns")
+            .metric_kind(MetricKind::Counter)
+            .build(),
+    )
+    .view(
+        TraceViewSpec::builder()
+            .id("process.cpu")
+            .title("CPU Usage")
+            .time_series()
+            .source("usage", "ProcessResourceUsageEvent")
+            .series(
+                SeriesSpec::builder()
+                    .id("cores")
+                    .expr("rate(usage.cpu_time_ns, usage.timestamp)")
+                    .unit("cores")
+                    .mark("step_area")
+                    .metric_kind(MetricKind::Gauge)
+                    .window(WindowSpec::builder().on_decrease(OnDecrease::Skip).build())
+                    .build(),
+            )
             .build(),
     )
     .build();
