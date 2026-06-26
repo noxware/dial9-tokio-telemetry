@@ -160,8 +160,7 @@ Rate over event order:
       { field: "usage.system_cpu_ns" }
     ]
   },
-  time: { field: "usage.timestamp" },
-  missing_previous: "skip"
+  time: { field: "usage.timestamp" }
 }
 ```
 
@@ -218,6 +217,10 @@ Potential later operations:
 ## Computed Fields
 
 Computed fields are event-local. They do not mutate raw wire fields.
+
+Computed field specs attach to event types. Source aliases are local to the spec that declares them.
+
+Expressions resolve raw and computed fields through the same field namespace, but runtime storage may keep computed values separate from raw fields.
 
 Recommended runtime shape:
 
@@ -312,16 +315,18 @@ Potential attributes:
 | `expr` | series/tooltip/guide/computed field | Expression to evaluate. |
 | `unit` | series/computed field/tooltip | Output unit. |
 | `metric.kind` | series output/computed field/field metadata | `gauge`, `counter`, `up_down_counter`. |
+| `transform` | view | Derives display items before rendering, e.g. `pair_intervals`. |
 | `group_by` | series | Split output into one series per unique key tuple. |
 | `reduce` | series | Collapse groups or multiple streams: `max`, `sum`, `avg`, `last`. |
 | `mark` | series | `line`, `step_line`, `step_area`, `bars`, `points`. |
 | `color` | series | Optional fixed color or palette key. |
-| `thresholds` | series | Values used for warning/danger coloring. |
+| `thresholds` | series | Threshold objects used for warning/danger coloring. |
 | `tooltip` | series/view | Tooltip rows. |
 | `display.kind` | display | `time_series`, `interval_bars`, `markers`, `heatmap`, `flamegraph`. |
 | `display.y_min` | display | Optional Y-axis minimum. |
 | `display.y_max` | display | Optional Y-axis maximum. |
 | `display.guides` | display | Reference lines/bands. |
+| `display.color_by` | display | Field/expression used for color encoding. |
 | `downsample` | series | `last_per_pixel`, `max_per_pixel`, `avg_per_pixel`, `min_max_per_pixel`. |
 | `window.missing_previous` | series | `skip`, `null`, `zero` for previous-sample expressions such as `rate`. |
 | `window.on_decrease` | series | `skip`, `warn`, `show` when previous-sample expressions detect an unexpected decrease. |
@@ -413,8 +418,8 @@ usage[0] = { timestamp: 1000, user_cpu_ns: 100, system_cpu_ns: 50 };
 usage[1] = { timestamp: 2000, user_cpu_ns: 500, system_cpu_ns: 150 };
 
 // After computed_fields:
-usage[0].cpu_time_ns = 150;
-usage[1].cpu_time_ns = 650;
+usage[0].computed = { cpu_time_ns: 150 };
+usage[1].computed = { cpu_time_ns: 650 };
 ```
 
 Output point:
@@ -457,7 +462,10 @@ The examples below show individual view specs. They can be wrapped in the bundle
       mark: "step_line",
       metric: { kind: "gauge" },
       group_by: ["accept.socket_cookie"],
-      thresholds: [80, 100],
+      thresholds: [
+        { value: 80, level: "warning" },
+        { value: 100, level: "critical" }
+      ],
       downsample: "max_per_pixel",
       tooltip: [
         { label: "Socket", expr: "point.current.accept.socket_cookie" },
