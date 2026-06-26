@@ -322,7 +322,7 @@ Potential attributes:
 | `display.y_min` | display | Optional Y-axis minimum. |
 | `display.y_max` | display | Optional Y-axis maximum. |
 | `display.guides` | display | Reference lines/bands. |
-| `downsample` | series/display | `last_per_pixel`, `max_per_pixel`, `avg_per_pixel`, `min_max_per_pixel`. |
+| `downsample` | series | `last_per_pixel`, `max_per_pixel`, `avg_per_pixel`, `min_max_per_pixel`. |
 | `window.missing_previous` | series | `skip`, `null`, `zero` for previous-sample expressions such as `rate`. |
 | `window.on_decrease` | series | `skip`, `warn`, `show` when previous-sample expressions detect an unexpected decrease. |
 | `sort` | source/series | Event ordering; default is timestamp. |
