@@ -20,6 +20,7 @@ const {
   getTraceTimeRange,
   hasCpuProfileSamples,
   buildProcessCpuUsageSeries,
+  buildSchemaDrivenTimeSeriesViews,
   analyzeAllocations,
   makeBarCoalescer,
   computePollWakes,
@@ -76,7 +77,6 @@ async function main() {
 
   function testResourceOnlyTraceRangeUsesProcessResourceUsageEvents() {
     const range = getTraceTimeRange([], [], [
-      { name: "OtherEvent", timestamp: 50, fields: {} },
       { name: "ProcessResourceUsageEvent", timestamp: 300, fields: {} },
       { name: "ProcessResourceUsageEvent", timestamp: 100, fields: {} },
     ]);
@@ -84,6 +84,17 @@ async function main() {
       fail(`resource-only range should come from process resource usage events, got ${JSON.stringify(range)}`);
     }
     pass("Resource-only trace range uses process resource usage events");
+  }
+
+  function testCustomOnlyTraceRangeUsesAnyCustomEvent() {
+    const range = getTraceTimeRange([], [], [
+      { name: "TcpAcceptQueueEvent", timestamp: 400, fields: {} },
+      { name: "TcpAcceptQueueEvent", timestamp: 200, fields: {} },
+    ]);
+    if (!range || range.minTs !== 200 || range.maxTs !== 400 || range.durationNs !== 200) {
+      fail(`custom-only range should come from custom events, got ${JSON.stringify(range)}`);
+    }
+    pass("Custom-only trace range uses custom event timestamps");
   }
 
   function testProcessCpuUsageSeriesDerivesIntervals() {
@@ -149,14 +160,106 @@ async function main() {
     pass("Process CPU usage series skips invalid pairs");
   }
 
+  function testSchemaDrivenCpuUsageSeries() {
+    const customEvents = [
+      {
+        name: "ProcessResourceUsageEvent",
+        timestamp: 0,
+        fields: { user_cpu_ns: "100000000", system_cpu_ns: "50000000", max_rss_bytes: "1024" },
+        units: { user_cpu_ns: "ns", system_cpu_ns: "ns", max_rss_bytes: "bytes" },
+      },
+      {
+        name: "ProcessResourceUsageEvent",
+        timestamp: 1_000_000_000,
+        fields: { user_cpu_ns: "500000000", system_cpu_ns: "150000000", max_rss_bytes: "2048" },
+        units: { user_cpu_ns: "ns", system_cpu_ns: "ns", max_rss_bytes: "bytes" },
+      },
+    ];
+    const trace = {
+      customEvents,
+      allEvents: customEvents,
+      eventStreams: new Map([
+        ["ProcessResourceUsageEvent", { name: "ProcessResourceUsageEvent", units: customEvents[0].units, events: customEvents }],
+      ]),
+      segmentMetadata: new Map([["process.available_parallelism", "4"]]),
+    };
+    const result = buildSchemaDrivenTimeSeriesViews(trace);
+    if (result.diagnostics.length !== 0) fail(`expected no schema diagnostics, got ${JSON.stringify(result.diagnostics)}`);
+    if (customEvents[0].computed?.cpu_time_ns !== 150_000_000) {
+      fail(`expected computed cpu_time_ns on first event, got ${JSON.stringify(customEvents[0].computed)}`);
+    }
+    const cpu = result.views.find((view) => view.spec.id === "process.cpu");
+    if (!cpu) fail("expected process.cpu schema view");
+    const points = cpu.series[0].groups[0].points;
+    if (points.length !== 1) fail(`expected one CPU point, got ${points.length}`);
+    if (Math.abs(points[0].value - 0.5) > 1e-9) fail(`expected 0.5 cores, got ${points[0].value}`);
+    if (points[0].value_delta_ns !== 500_000_000 || points[0].wall_delta_ns !== 1_000_000_000) {
+      fail(`unexpected CPU deltas: ${JSON.stringify(points[0])}`);
+    }
+    pass("Schema-driven CPU usage derives computed field and rate series");
+  }
+
+  function testSchemaDrivenMaxRssSeries() {
+    const customEvents = [
+      { name: "ProcessResourceUsageEvent", timestamp: 10, fields: { user_cpu_ns: "1", system_cpu_ns: "1", max_rss_bytes: "4096" } },
+      { name: "ProcessResourceUsageEvent", timestamp: 20, fields: { user_cpu_ns: "2", system_cpu_ns: "2", max_rss_bytes: "8192" } },
+    ];
+    const trace = { customEvents, allEvents: customEvents, segmentMetadata: new Map() };
+    const result = buildSchemaDrivenTimeSeriesViews(trace);
+    const rss = result.views.find((view) => view.spec.id === "process.max_rss");
+    if (!rss) fail("expected process.max_rss schema view");
+    const points = rss.series[0].groups[0].points;
+    if (points.length !== 2 || points[1].value !== 8192) {
+      fail(`unexpected Max RSS points: ${JSON.stringify(points)}`);
+    }
+    pass("Schema-driven Max RSS direct field series is built");
+  }
+
+  function testSchemaDrivenSocketAcceptQueueGroups() {
+    const customEvents = [
+      { name: "TcpAcceptQueueEvent", timestamp: 10, fields: { socket_cookie: "a", pending_connections: "4", backlog_limit: "10", local_addr: "127.0.0.1", local_port: "3000" } },
+      { name: "TcpAcceptQueueEvent", timestamp: 20, fields: { socket_cookie: "b", pending_connections: "2", backlog_limit: "10", local_addr: "127.0.0.1", local_port: "3001" } },
+      { name: "TcpAcceptQueueEvent", timestamp: 30, fields: { socket_cookie: "a", pending_connections: "8", backlog_limit: "10", local_addr: "127.0.0.1", local_port: "3000" } },
+    ];
+    const trace = { customEvents, allEvents: customEvents, segmentMetadata: new Map() };
+    const result = buildSchemaDrivenTimeSeriesViews(trace);
+    const socket = result.views.find((view) => view.spec.id === "socket.accept_queue");
+    if (!socket) fail("expected socket.accept_queue schema view");
+    const groups = socket.series[0].groups;
+    if (groups.length !== 2) fail(`expected two socket groups, got ${groups.length}`);
+    const a = groups.find((group) => group.values[0] === "a");
+    if (!a || a.points.length !== 2 || a.points[1].value !== 80) {
+      fail(`unexpected socket group a points: ${JSON.stringify(a)}`);
+    }
+    pass("Schema-driven socket accept queue groups by socket cookie");
+  }
+
   testProfilerOnlyTraceRangeUsesCpuSamples();
   testProfilerOnlyTraceRangeExpandsSingleCpuSample();
   testResourceOnlyTraceRangeUsesProcessResourceUsageEvents();
+  testCustomOnlyTraceRangeUsesAnyCustomEvent();
   testProcessCpuUsageSeriesDerivesIntervals();
   testProcessCpuUsageSeriesSkipsInvalidPairs();
+  testSchemaDrivenCpuUsageSeries();
+  testSchemaDrivenMaxRssSeries();
+  testSchemaDrivenSocketAcceptQueueGroups();
 
   const trace = await parseTrace(fs.readFileSync(tracePath));
   const evts = trace.events;
+
+  function testParsedTraceExposesRawEventStreams() {
+    if (!(trace.eventStreams instanceof Map)) fail("trace.eventStreams should be a Map");
+    if (!Array.isArray(trace.allEvents)) fail("trace.allEvents should be an array");
+    if (trace.allEvents.length === 0) fail("trace.allEvents should contain decoded raw events");
+    if (!trace.eventStreams.has("PollStartEvent")) fail("eventStreams should include built-in PollStartEvent");
+    const stream = trace.eventStreams.get("PollStartEvent");
+    if (!stream || !Array.isArray(stream.events) || stream.events.length === 0) {
+      fail("PollStartEvent stream should contain raw events");
+    }
+    pass("Parsed trace exposes raw event streams for built-in events");
+  }
+
+  testParsedTraceExposesRawEventStreams();
 
   const wSet = new Set();
   evts.forEach((e) => {

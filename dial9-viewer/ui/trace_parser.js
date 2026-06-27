@@ -275,6 +275,8 @@
    *   taskTerminateTimes: Map<number, number>,
    *   taskInstrumented: Map<number, boolean>,
    *   cpuSamples: CpuSample[],
+   *   allEvents: Array<{name: string, timestamp: number, fields: Object, units: Object|null, typeId: number}>,
+   *   eventStreams: Map<string, {name: string, units: Object|null, events: Array}>,
    *   callframeSymbols: Map<string, SymbolFrame|SymbolFrame[]>,
    *   threadNames: Map<number, string>,
    *   runtimeWorkers: Map<string, number[]>,
@@ -531,6 +533,8 @@
       runtimeWorkers: new Map(), // runtime name → [workerId, ...]
       segmentMetadata: new Map(), // latest segment metadata key → value
       taskDumps: new Map(), // taskId → [{timestamp, callchain}] sorted by timestamp
+      allEvents: [], // raw decoded events across built-in and custom schemas
+      eventStreams: new Map(), // event name → {name, units, events}
       customEvents: [], // unrecognized event types: {name, timestamp, fields}
       // { monotonicNs, realtimeNs } anchors used to recover wall clock.
       clockSyncAnchors: [],
@@ -594,8 +598,31 @@
     const runtimeWorkers = state.runtimeWorkers;
     const segmentMetadata = state.segmentMetadata;
     const taskDumps = state.taskDumps;
+    const allEvents = state.allEvents;
+    const eventStreams = state.eventStreams;
     const customEvents = state.customEvents;
     const clockSyncAnchors = state.clockSyncAnchors;
+
+    let rawEvent = null;
+    if (!TRACE_BOUND_EXCLUDED_FRAMES.has(frame.name) && ts != null) {
+      const schema = dec.schemas.get(frame.typeId);
+      rawEvent = {
+        name: frame.name,
+        timestamp: ts,
+        fields: v,
+        units: schema?.units || null,
+        typeId: frame.typeId,
+      };
+      allEvents.push(rawEvent);
+      let stream = eventStreams.get(frame.name);
+      if (!stream) {
+        stream = { name: frame.name, units: rawEvent.units, events: [] };
+        eventStreams.set(frame.name, stream);
+      } else if (!stream.units && rawEvent.units) {
+        stream.units = rawEvent.units;
+      }
+      stream.events.push(rawEvent);
+    }
 
     switch (frame.name) {
         case "PollStartEvent": {
@@ -834,13 +861,8 @@
         }
         default: {
           // Unrecognized event type: capture as a custom event
-          if (ts != null) {
-            customEvents.push({
-              name: frame.name,
-              timestamp: ts,
-              fields: v,
-              units: dec.schemas.get(frame.typeId)?.units || null,
-            });
+          if (rawEvent != null) {
+            customEvents.push(rawEvent);
           }
           break;
         }
@@ -858,7 +880,7 @@
       events, spawnLocations, taskSpawnLocs, taskSpawnTimes, taskTerminateTimes,
       taskInstrumented, callframeSymbols, cpuSamples, allocEvents, freeEvents,
       memoryOverflows, threadNames, tidToWorker, runtimeWorkers, segmentMetadata, taskDumps,
-      customEvents, clockSyncAnchors, maxEvents, startTime, endTime, hasTimeFilter,
+      allEvents, eventStreams, customEvents, clockSyncAnchors, maxEvents, startTime, endTime, hasTimeFilter,
     } = state;
 
     // Legacy fallback: synthesize an anchor from legacy SegmentMetadata wall
@@ -941,6 +963,8 @@
       taskTerminateTimes,
       runtimeWorkers,
       segmentMetadata,
+      allEvents,
+      eventStreams,
       customEvents,
       taskDumps,
       clockSyncAnchors,
@@ -1197,6 +1221,8 @@
     const events = [];
     const cpuSamples = [];
     const customEvents = [];
+    const allEvents = [];
+    const eventStreams = new Map();
     const allocEvents = [];
     const freeEvents = [];
     const memoryOverflows = [];
@@ -1220,6 +1246,7 @@
           break;
         case 'e': events.push(rec.d); break;
         case 'c': cpuSamples.push(rec.d); break;
+        case 'r': allEvents.push(rec.d); break;
         case 'x': customEvents.push(rec.d); break;
         case 'a': allocEvents.push(rec.d); break;
         case 'f': freeEvents.push(rec.d); break;
@@ -1229,6 +1256,18 @@
     raw.events = events;
     raw.cpuSamples = cpuSamples;
     if (!raw.segmentMetadata) raw.segmentMetadata = new Map();
+    raw.allEvents = allEvents;
+    raw.eventStreams = eventStreams;
+    for (const ev of allEvents) {
+      let stream = eventStreams.get(ev.name);
+      if (!stream) {
+        stream = { name: ev.name, units: ev.units || null, events: [] };
+        eventStreams.set(ev.name, stream);
+      } else if (!stream.units && ev.units) {
+        stream.units = ev.units;
+      }
+      stream.events.push(ev);
+    }
     raw.customEvents = customEvents;
     raw.allocEvents = allocEvents;
     raw.freeEvents = freeEvents;
